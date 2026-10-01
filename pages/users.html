@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Users | Acer Biomedical</title>
+
+  <link rel="stylesheet" href="../css/accure.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+</head>
+
+<body>
+  <div class="container">
+
+    <aside class="sidebar">
+      <div class="logo">
+        <img src="../images/comapny_logo-Photoroom.png" alt="Acer Biomedical">
+      </div>
+
+      <ul>
+        <li><a href="../main_dashboard.html"><i class="fa-solid fa-house"></i><span>Dashboard</span></a></li>
+        <li><a href="orders.html"><i class="fa-solid fa-cart-shopping"></i><span>Orders</span></a></li>
+        <li><a href="inventory.html"><i class="fa-solid fa-boxes-stacked"></i><span>Inventory</span></a></li>
+        <li><a href="shipment.html"><i class="fa-solid fa-boxes-packing"></i><span>Shipment</span></a></li>
+        <li><a href="assembly.html"><i class="fa-solid fa-gears"></i><span>Assembly</span></a></li>
+
+        <li><a href="service.html"><i class="fa-solid fa-screwdriver-wrench"></i><span>Service</span></a></li>
+        <li><a href="allocated.html"><i class="fa-solid fa-people-carry-box"></i><span>Allocated</span></a></li>
+        <li><a href="dispatch.html"><i class="fa-solid fa-truck-fast"></i><span>Dispatch</span></a></li>
+        <li><a href="attendance.html"><i class="fa-solid fa-calendar-check"></i><span>Attendance</span></a></li>
+
+        <li class="active"><a href="users.html"><i class="fa-solid fa-users"></i><span>Users</span></a></li>
+        <li><a href="reports.html"><i class="fa-solid fa-chart-column"></i><span>Reports</span></a></li>
+        <li>
+          <a href="#" onclick="openLogoutModal(event)">
+            <i class="fa-solid fa-arrow-right-from-bracket"></i>
+            <span>Logout</span>
+          </a>
+        </li>
+      </ul>
+
+      <div class="sidebar-profile">
+        <img src="../images/admin.jpg" alt="Admin">
+        <div>
+          <h4 id="sidebarUserName">Admin</h4>
+          <p id="sidebarUserRole">Super Admin</p>
+        </div>
+      </div>
+    </aside>
+
+    <main>
+      <header>
+        <div>
+          <h1>Users</h1>
+          <p>Manage staff accounts and roles</p>
+        </div>
+        <div class="right-header">
+          <div class="search">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <input type="text" placeholder="Search username or name">
+          </div>
+          <button><i class="fa-regular fa-bell"></i></button>
+          <button><i class="fa-regular fa-envelope"></i></button>
+          <div class="profile">
+            <img src="../images/admin.jpg" alt="Admin">
+            <div>
+              <h4 id="headerUserName">Admin</h4>
+              <p id="headerUserRole">Super Admin</p>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <section class="cards">
+        <div class="card">
+          <div><span>Total Users</span>
+            <h2 id="cardTotal">0</h2>
+            <p>All accounts</p>
+          </div>
+          <i class="fa-solid fa-users"></i>
+        </div>
+        <div class="card">
+          <div><span>Admins</span>
+            <h2 id="cardAdmins">0</h2>
+            <p>Full access</p>
+          </div>
+          <i class="fa-solid fa-user-shield"></i>
+        </div>
+        <div class="card">
+          <div><span>Accounts</span>
+            <h2 id="cardEmployees">0</h2>
+            <p>Orders, inventory, service</p>
+          </div>
+          <i class="fa-solid fa-user-tie"></i>
+        </div>
+        <div class="card">
+          <div><span>Technicians</span>
+            <h2 id="cardTechnicians">0</h2>
+            <p>Field service</p>
+          </div>
+          <i class="fa-solid fa-user-gear"></i>
+        </div>
+        <div class="card">
+          <div><span>Employee-Sales Persons</span>
+            <h2 id="cardDistributors">0</h2>
+            <p>Sales &amp; demo units</p>
+          </div>
+          <i class="fa-solid fa-handshake"></i>
+        </div>
+        <div class="card">
+          <div><span>Inventory Managers</span>
+            <h2 id="cardInventoryManagers">0</h2>
+            <p>Inventory only</p>
+          </div>
+          <i class="fa-solid fa-boxes-stacked"></i>
+        </div>
+      </section>
+
+      <div class="top-actions">
+        <button class="add-product"><i class="fa-solid fa-plus"></i> Add User</button>
+      </div>
+
+      <section class="filter-section">
+        <div class="filter-box">
+          <i class="fa-solid fa-filter"></i>
+          <select id="roleFilter">
+            <option>All Roles</option>
+            <option value="admin">Admin</option>
+            <option value="accounts">Accounts</option>
+            <option value="service_manager">Service Manager</option>
+            <option value="assembly">Assembly</option>
+            <option value="technician">Technician</option>
+            <option value="distributor">Employee-Sales Person</option>
+            <option value="inventory_manager">Inventory Manager</option>
+          </select>
+        </div>
+        <button class="filter-btn"><i class="fa-solid fa-filter"></i> Apply Filter</button>
+      </section>
+
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Name</th>
+              <th>Role</th>
+              <th>Company</th>
+              <th>Mobile</th>
+              <th>Team Manager</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- rows rendered dynamically by users.js -->
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pagination">
+        <button class="page-btn"><i class="fa-solid fa-angle-left"></i></button>
+        <button class="page active-page">1</button>
+        <button class="page">2</button>
+        <button class="page-btn"><i class="fa-solid fa-angle-right"></i></button>
+      </div>
+    </main>
+
+  </div>
+
+  <!-- Logout Modal -->
+  <div id="logoutModal" class="logout-modal">
+    <div class="logout-box">
+      <i class="fa-solid fa-arrow-right-from-bracket logout-icon"></i>
+      <h2>Logout?</h2>
+      <p>Are you sure you want to logout from your account?</p>
+      <div class="logout-actions">
+        <button class="cancel-btn" onclick="closeLogoutModal()">Cancel</button>
+        <button class="confirm-btn" onclick="logoutNow()">Logout</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- common_auth.js MUST load first: enforces login + role-based page access -->
+  <script src="../common_auth.js"></script>
+
+  <!-- Add/Edit User Modal (built dynamically) -->
+  <div id="userModal" class="modal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
+    <div class="modal-content"
+      style="background:#fff;border-radius:16px;padding:26px;width:440px;max-height:86vh;overflow-y:auto;"></div>
+  </div>
+
+  <!-- Delete Confirm Modal -->
+  <div id="deleteModal" class="modal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
+    <div class="modal-content" style="background:#fff;border-radius:16px;padding:26px;width:380px;text-align:center;">
+      <h3 style="margin-bottom:10px;">Delete User?</h3>
+      <p style="color:#64748b;margin-bottom:20px;">This action cannot be undone.</p>
+      <div style="display:flex;justify-content:center;gap:10px;">
+        <button class="cancel-btn"
+          style="padding:10px 16px;border:none;border-radius:8px;background:#eee;cursor:pointer;">Cancel</button>
+        <button class="delete-btn"
+          style="padding:10px 16px;border:none;border-radius:8px;background:#d62828;color:#fff;cursor:pointer;">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function openLogoutModal(e) {
+      e.preventDefault();
+      document.getElementById("logoutModal").classList.add("active");
+    }
+    function closeLogoutModal() {
+      document.getElementById("logoutModal").classList.remove("active");
+    }
+    document.addEventListener('DOMContentLoaded', () => {
+      const role = getRole() || '';
+      const uname = getUsername() || 'User';
+      const label = role.charAt(0).toUpperCase() + role.slice(1);
+      ['sidebarUserName', 'headerUserName'].forEach(id => document.getElementById(id).textContent = uname);
+      ['sidebarUserRole', 'headerUserRole'].forEach(id => document.getElementById(id).textContent = label);
+    });
+  </script>
+  <script src="users.js"></script>
+</body>
+
+</html>

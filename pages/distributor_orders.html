@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>My Orders | Acer Biomedical</title>
+
+  <link rel="stylesheet" href="../css/accure.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+</head>
+
+<body>
+  <div class="container">
+
+    <aside class="sidebar">
+      <div class="logo">
+        <img src="../images/comapny_logo-Photoroom.png" alt="Acer Biomedical">
+      </div>
+
+      <ul>
+        <li><a href="distributor.html"><i class="fa-solid fa-handshake"></i><span>My Demo Units</span></a></li>
+        <li class="active"><a href="distributor_orders.html"><i class="fa-solid fa-cart-shopping"></i><span>My
+              Orders</span></a></li>
+        <li><a href="technician.html"><i class="fa-solid fa-user-gear"></i><span>My Services</span></a></li>
+
+        <li><a href="distributor_team.html"><i class="fa-solid fa-people-group"></i><span>Team</span></a></li>
+
+        <li>
+          <a href="#" onclick="openLogoutModal(event)">
+            <i class="fa-solid fa-arrow-right-from-bracket"></i>
+            <span>Logout</span>
+          </a>
+        </li>
+      </ul>
+
+      <div class="sidebar-profile">
+        <img src="../images/admin.jpg" alt="Sales Person">
+        <div>
+          <h4 id="sidebarUserName">Sales Person</h4>
+          <p id="sidebarUserRole">Sales Person</p>
+        </div>
+      </div>
+    </aside>
+
+    <main>
+      <header>
+        <div>
+          <h1>My Orders</h1>
+          <p>Orders raised for your customers and their delivery status</p>
+        </div>
+        <div class="right-header">
+          <div class="search">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <input type="text" placeholder="Search customer, product or serial no...">
+          </div>
+          <button><i class="fa-regular fa-bell"></i></button>
+          <div class="profile">
+            <img src="../images/admin.jpg" alt="Sales Person">
+            <div>
+              <h4 id="headerUserName">Sales Person</h4>
+              <p id="headerUserRole">Sales Person</p>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- ORDER CARDS -->
+      <section class="cards">
+        <div class="card">
+          <div><span>Total Orders</span>
+            <h2 id="cardTotalOrders">0</h2>
+            <p>Orders placed for your customers</p>
+          </div>
+          <i class="fa-solid fa-layer-group"></i>
+        </div>
+        <div class="card">
+          <div><span>Today's Order Amount</span>
+            <h2 id="cardTodayAmount">₹0</h2>
+            <p>Orders placed today</p>
+          </div>
+          <i class="fa-solid fa-indian-rupee-sign"></i>
+        </div>
+        <div class="card">
+          <div><span>Today's Orders</span>
+            <h2 id="cardTodayOrders">0</h2>
+            <p>Orders placed today</p>
+          </div>
+          <i class="fa-regular fa-calendar-check"></i>
+        </div>
+        <div class="card">
+          <div><span>Delivered</span>
+            <h2 id="cardDelivered">0</h2>
+            <p>Confirmed delivered to customer</p>
+          </div>
+          <i class="fa-solid fa-truck"></i>
+        </div>
+        <div class="card">
+          <div><span>Pending</span>
+            <h2 id="cardPendingOrders">0</h2>
+            <p>Not yet delivered</p>
+          </div>
+          <i class="fa-solid fa-hourglass-half"></i>
+        </div>
+      </section>
+
+      <div class="top-actions">
+        <button class="add-product" id="createOrderBtn"><i class="fa-solid fa-plus"></i> Create Order</button>
+      </div>
+
+      <section class="filter-section">
+        <div class="filter-box">
+          <i class="fa-solid fa-filter"></i>
+          <select id="statusFilter">
+            <option value="">All Status</option>
+            <option value="under_approval">Under Approval</option>
+            <option value="pending">Pending</option>
+            <option value="dispatched">Dispatched</option>
+            <option value="delivered">Delivered</option>
+          </select>
+        </div>
+        <button class="filter-btn" id="applyOrderFilter"><i class="fa-solid fa-filter"></i> Apply Filter</button>
+      </section>
+
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Order ID</th>
+              <th>Customer</th>
+              <th>Product(s)</th>
+              <th>Payment Mode</th>
+              <th>Amount</th>
+              <th>Order Date</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="ordersTbody">
+            <!-- rows rendered dynamically by distributor_orders.js -->
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pagination">
+        <button class="page-btn"><i class="fa-solid fa-angle-left"></i></button>
+        <button class="page active-page">1</button>
+        <button class="page-btn"><i class="fa-solid fa-angle-right"></i></button>
+      </div>
+    </main>
+
+  </div>
+
+  <!-- Logout Modal -->
+  <div id="logoutModal" class="logout-modal">
+    <div class="logout-box">
+      <i class="fa-solid fa-arrow-right-from-bracket logout-icon"></i>
+      <h2>Logout?</h2>
+      <p>Are you sure you want to logout from your account?</p>
+      <div class="logout-actions">
+        <button class="cancel-btn" onclick="closeLogoutModal()">Cancel</button>
+        <button class="confirm-btn" onclick="logoutNow()">Logout</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- common_auth.js MUST load first: enforces login + role-based page access -->
+  <script src="../common_auth.js"></script>
+
+  <!-- View Order Modal -->
+  <div id="viewOrderModal" class="modal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
+    <div class="modal-content"
+      style="background:#fff;border-radius:16px;padding:26px;width:440px;max-height:86vh;overflow-y:auto;"></div>
+  </div>
+
+  <!-- Create Order Modal (wizard built dynamically) -->
+  <div id="orderModal" class="modal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
+    <div class="modal-content"
+      style="background:#fff;border-radius:14px;padding:24px;width:460px;max-height:86vh;overflow-y:auto;"></div>
+  </div>
+
+  <script>
+    function openLogoutModal(e) {
+      e.preventDefault();
+      document.getElementById("logoutModal").classList.add("active");
+    }
+    function closeLogoutModal() {
+      document.getElementById("logoutModal").classList.remove("active");
+    }
+    document.addEventListener('DOMContentLoaded', () => {
+      const role = getRole() || '';
+      const uname = getUsername() || 'User';
+      const label = role.charAt(0).toUpperCase() + role.slice(1);
+      ['sidebarUserName', 'headerUserName'].forEach(id => document.getElementById(id).textContent = uname);
+      ['sidebarUserRole', 'headerUserRole'].forEach(id => document.getElementById(id).textContent = label);
+    });
+  </script>
+  <script src="distributor_orders.js"></script>
+</body>
+
+</html>

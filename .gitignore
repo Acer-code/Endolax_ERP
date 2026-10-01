@@ -1,0 +1,13 @@
+venv
+logs/
+__pycache__/
+.vscode/
+.env
+.git
+*.pyc
+notrace/credentials.json
+data_push.py
+dist/
+build/
+main.js
+node_modules/

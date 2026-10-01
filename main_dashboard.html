@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard | Acer Biomedical</title>
+
+  <link rel="stylesheet" href="css/accure.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
+</head>
+
+<body>
+  <div class="container">
+    <aside class="sidebar">
+      <div class="logo">
+        <img src="images/comapny_logo-Photoroom.png" alt="Acer Biomedical" />
+      </div>
+
+      <ul>
+        <li class="active">
+          <a href="main_dashboard.html"><i class="fa-solid fa-house"></i><span>Dashboard</span></a>
+        </li>
+        <li>
+          <a href="pages/orders.html"><i class="fa-solid fa-cart-shopping"></i><span>Orders</span></a>
+        </li>
+
+        <li>
+          <a href="pages/inventory.html"><i class="fa-solid fa-boxes-stacked"></i><span>Inventory</span></a>
+        </li>
+        <li><a href="pages/shipment.html"><i class="fa-solid fa-boxes-packing"></i><span>Shipment</span></a></li>
+        <li><a href="pages/assembly.html"><i class="fa-solid fa-gears"></i><span>Assembly</span></a></li>
+
+        <li>
+          <a href="pages/service.html"><i class="fa-solid fa-screwdriver-wrench"></i><span>Service</span></a>
+        </li>
+         <li>
+          <a href="pages/technician.html"><i class="fa-solid fa-user-gear"></i><span>My Services</span></a>
+        </li>
+        <li>
+          <a href="pages/distributor.html"><i class="fa-solid fa-handshake"></i><span>My Demo Units</span></a>
+        </li>
+        <li><a href="pages/allocated.html"><i class="fa-solid fa-people-carry-box"></i><span>Allocated</span></a></li>
+        <li><a href="pages/dispatch.html"><i class="fa-solid fa-truck-fast"></i><span>Dispatch</span></a></li>
+        <li><a href="pages/attendance.html"><i class="fa-solid fa-calendar-check"></i><span>Attendance</span></a></li>
+
+        <li>
+          <a href="pages/users.html"><i class="fa-solid fa-users"></i><span>Users</span></a>
+        </li>
+        <li>
+          <a href="pages/reports.html"><i class="fa-solid fa-chart-column"></i><span>Reports</span></a>
+        </li>
+        <li>
+          <a href="#" onclick="openLogoutModal(event)">
+            <i class="fa-solid fa-arrow-right-from-bracket"></i>
+            <span>Logout</span>
+          </a>
+        </li>
+      </ul>
+
+      <div class="sidebar-profile">
+        <img src="images/admin.jpg" alt="Admin" />
+        <div>
+          <h4 id="sidebarUserName">Admin User</h4>
+          <p id="sidebarUserRole">Administrator</p>
+        </div>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div class="left">
+          <h1>Dashboard</h1>
+        </div>
+        <div class="right">
+          <div class="search">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <input type="text" placeholder="Search anything..." />
+          </div>
+          <button><i class="fa-regular fa-bell"></i></button>
+          <button><i class="fa-regular fa-message"></i></button>
+          <div class="profile">
+            <img src="images/admin.jpg" alt="Admin" />
+            <div>
+              <h4 id="headerUserName">Admin User</h4>
+              <p id="headerUserRole">Administrator</p>
+            </div>
+          </div>
+        </div>
+      </header>
+      <section class="welcome-section">
+        <div class="welcome-left">
+          <h2 id="welcomeText">Welcome Back, Admin</h2>
+          <p>Here's what's happening with your business today.</p>
+        </div>
+        <div class="date-box">
+          <i class="fa-regular fa-calendar"></i>
+          <span>20 May 2025</span>
+        </div>
+      </section>
+      <section class="cards">
+        <div class="card">
+          <div>
+            <span>Total Orders</span>
+            <h2>1,250</h2>
+            <p>
+              <i class="fa-solid fa-arrow-up text-success"></i> 12.5% from
+              last month
+            </p>
+          </div>
+          <i class="fa-solid fa-bag-shopping card-icon-blue"></i>
+        </div>
+
+        <div class="card">
+          <div>
+            <span>Pending Orders</span>
+            <h2>186</h2>
+            <p>
+              <i class="fa-solid fa-arrow-up text-warning"></i> 8.2% from last
+              month
+            </p>
+          </div>
+          <i class="fa-regular fa-clock card-icon-orange"></i>
+        </div>
+
+        <div class="card">
+          <div>
+            <span>Inventory Items</span>
+            <h2>4,865</h2>
+            <p>
+              <i class="fa-solid fa-arrow-up text-success"></i> 8.3% from last
+              month
+            </p>
+          </div>
+          <i class="fa-solid fa-cube card-icon-green"></i>
+        </div>
+
+        <div class="card">
+          <div>
+            <span>Total Employees</span>
+            <h2>182</h2>
+            <p>
+              <i class="fa-solid fa-arrow-up text-success"></i> 5.4% from last
+              month
+            </p>
+          </div>
+          <i class="fa-solid fa-users card-icon-purple"></i>
+        </div>
+
+        <div class="card">
+          <div>
+            <span>Active Services</span>
+            <h2>128</h2>
+            <p>
+              <i class="fa-solid fa-arrow-up text-success"></i> 10.2% from
+              last month
+            </p>
+          </div>
+          <i class="fa-solid fa-screwdriver-wrench card-icon-orange"></i>
+        </div>
+      </section>
+      <section class="dashboard-grid">
+        <div class="dashboard-left-stack" style="display:flex;flex-direction:column;gap:24px;">
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Recent Orders</h3>
+              <a href="pages/orders.html"><button class="view-all-btn">View All</button></a>
+            </div>
+
+            <div class="order-list" style="max-height:230px;overflow-y:auto;">
+              <div class="order-item">
+                <div class="order-left">
+                  <div class="order-icon">
+                    <i class="fa-solid fa-file-medical"></i>
+                  </div>
+                  <div>
+                    <h4>ORD1025</h4>
+                    <p>20 May 2025</p>
+                  </div>
+                </div>
+                <span class="status pending">Pending</span>
+                <strong>₹24,500</strong>
+              </div>
+
+              <div class="order-item">
+                <div class="order-left">
+                  <div class="order-icon">
+                    <i class="fa-solid fa-file-medical"></i>
+                  </div>
+                  <div>
+                    <h4>ORD1024</h4>
+                    <p>19 May 2025</p>
+                  </div>
+                </div>
+                <span class="status delivered">Delivered</span>
+                <strong>₹18,750</strong>
+              </div>
+
+              <div class="order-item">
+                <div class="order-left">
+                  <div class="order-icon">
+                    <i class="fa-solid fa-file-medical"></i>
+                  </div>
+                  <div>
+                    <h4>ORD1023</h4>
+                    <p>18 May 2025</p>
+                  </div>
+                </div>
+                <span class="status processing">Processing</span>
+                <strong>₹32,100</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel" id="myTeamPanel">
+            <div class="panel-header">
+              <h3>My Team</h3>
+              <p style="color:#64748b;font-size:13px;">Click a member to see their report</p>
+            </div>
+            <div class="service-list" id="teamMemberList" style="max-height:280px;overflow-y:auto;"></div>
+          </div>
+        </div>
+        <div class="dashboard-right">
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Inventory Status</h3>
+              <a href="pages/inventory.html"><button class="view-all-btn">View All</button></a>
+            </div>
+
+            <div class="inventory-status">
+              <div class="inventory-item">
+                <div class="inventory-head">
+                  <div>
+                    <i class="fa-solid fa-circle-check text-success"></i>
+                    Stock Available
+                  </div>
+                  <strong>3,256</strong>
+                </div>
+                <div class="progress-bar">
+                  <div class="progress-fill green" style="width: 67%"></div>
+                </div>
+                <small>67%</small>
+              </div>
+
+              <div class="inventory-item">
+                <div class="inventory-head">
+                  <div>
+                    <i class="fa-solid fa-triangle-exclamation text-warning"></i>
+                    Low Stock Items
+                  </div>
+                  <strong>1,125</strong>
+                </div>
+                <div class="progress-bar">
+                  <div class="progress-fill orange" style="width: 23%"></div>
+                </div>
+                <small>23%</small>
+              </div>
+
+              <div class="inventory-item">
+                <div class="inventory-head">
+                  <div>
+                    <i class="fa-solid fa-circle-xmark text-danger"></i> Out
+                    Of Stock
+                  </div>
+                  <strong>484</strong>
+                </div>
+                <div class="progress-bar">
+                  <div class="progress-fill red" style="width: 10%"></div>
+                </div>
+                <small>10%</small>
+              </div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Service Requests</h3>
+              <a href="pages/service.html"><button class="view-all-btn">View All</button></a>
+            </div>
+
+            <div class="service-list" id="serviceRequestsList">
+              <div class="service-item">
+                <div>
+                  <h4>Ticket #251</h4>
+                  <p>20 May 2025</p>
+                </div>
+                <span class="status pending">Open</span>
+              </div>
+
+              <div class="service-item">
+                <div>
+                  <h4>Ticket #250</h4>
+                  <p>19 May 2025</p>
+                </div>
+                <span class="status delivered">Closed</span>
+              </div>
+
+              <div class="service-item">
+                <div>
+                  <h4>Ticket #249</h4>
+                  <p>18 May 2025</p>
+                </div>
+                <span class="status processing">Pending</span>
+              </div>
+
+              <div class="service-item">
+                <div>
+                  <h4>Ticket #248</h4>
+                  <p>17 May 2025</p>
+                </div>
+                <span class="status cancelled">On Hold</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div id="logoutModal" class="logout-modal">
+    <div class="logout-box">
+      <i class="fa-solid fa-arrow-right-from-bracket logout-icon"></i>
+
+      <h2>Logout?</h2>
+
+      <p>Are you sure you want to logout from your account?</p>
+
+      <div class="logout-actions">
+        <button class="cancel-btn" onclick="closeLogoutModal()">
+          Cancel
+        </button>
+
+        <button class="confirm-btn" onclick="logoutNow()">Logout</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Team Member Report Modal (populated dynamically by dashboard.js) -->
+  <div id="teamReportModal" class="modal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
+    <div class="modal-content" style="background:#fff;border-radius:16px;padding:26px;width:460px;max-height:86vh;overflow-y:auto;"></div>
+  </div>
+  <script src="common_auth.js"></script>
+  <script>
+    function openLogoutModal(e) {
+      e.preventDefault();
+      document.getElementById("logoutModal").classList.add("active");
+    }
+    function closeLogoutModal() {
+      document.getElementById("logoutModal").classList.remove("active");
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      const role = getRole() || "admin";
+      const uname = getUsername() || "Admin User";
+      const label = role.charAt(0).toUpperCase() + role.slice(1);
+      ["sidebarUserName", "headerUserName"].forEach(
+        (id) => (document.getElementById(id).textContent = uname),
+      );
+      ["sidebarUserRole", "headerUserRole"].forEach(
+        (id) => (document.getElementById(id).textContent = label),
+      );
+      document.getElementById("welcomeText").textContent =
+        `Welcome Back, ${uname}`;
+    });
+  </script>
+  <script src="dashboard.js"></script>
+</body>
+
+</html>

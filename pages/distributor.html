@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>My Demo Units | Acer Biomedical</title>
+
+  <link rel="stylesheet" href="../css/accure.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+</head>
+
+<body>
+  <div class="container">
+
+    <aside class="sidebar">
+      <div class="logo">
+        <img src="../images/comapny_logo-Photoroom.png" alt="Acer Biomedical">
+      </div>
+
+      <ul>
+        <li class="active"><a href="distributor.html"><i class="fa-solid fa-handshake"></i><span>My Demo
+              Units</span></a></li>
+        <li><a href="distributor_orders.html"><i class="fa-solid fa-cart-shopping"></i><span>My Orders</span></a></li>
+        <li><a href="technician.html"><i class="fa-solid fa-user-gear"></i><span>My Services</span></a></li>
+        <li><a href="technician_dashboard.html"><i class="fa-solid fa-house"></i><span>Dashboard</span></a></li>
+        <li><a href="distributor_team.html"><i class="fa-solid fa-people-group"></i><span>Team</span></a></li>
+
+        <li>
+          <a href="#" onclick="openLogoutModal(event)">
+            <i class="fa-solid fa-arrow-right-from-bracket"></i>
+            <span>Logout</span>
+          </a>
+        </li>
+      </ul>
+
+      <div class="sidebar-profile">
+        <img src="../images/admin.jpg" alt="Sales Person">
+        <div>
+          <h4 id="sidebarUserName">Sales Person</h4>
+          <p id="sidebarUserRole">Sales Person</p>
+        </div>
+      </div>
+    </aside>
+
+    <main>
+      <header>
+        <div>
+          <h1>My Demo Units</h1>
+          <p>Alloted demo units and Returns.</p>
+        </div>
+        <div class="right-header">
+          <div class="search">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <input type="text" placeholder="Search customer or product...">
+          </div>
+          <button><i class="fa-regular fa-bell"></i></button>
+          <div class="profile">
+            <img src="../images/admin.jpg" alt="Sales Person">
+            <div>
+              <h4 id="headerUserName">Sales Person</h4>
+              <p id="headerUserRole">Sales Person</p>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- WELCOME -->
+      <section class="welcome-section">
+        <div class="welcome-left">
+          <h2 id="welcomeText">Welcome Back</h2>
+          <p>Here's an overview of your demo unit allotments.</p>
+        </div>
+        <div class="date-box">
+          <i class="fa-regular fa-calendar"></i>
+          <span id="todayDate"></span>
+        </div>
+      </section>
+
+      <!-- DEMO UNIT CARDS -->
+      <section class="cards">
+        <div class="card">
+          <div><span>Total Allotted</span>
+            <h2 id="cardTotal">0</h2>
+            <p>All demo units you've given out</p>
+          </div>
+          <i class="fa-solid fa-layer-group"></i>
+        </div>
+        <div class="card">
+          <div><span>Not Returned</span>
+            <h2 id="cardNotReturned">0</h2>
+            <p>Currently with customers</p>
+          </div>
+          <i class="fa-solid fa-box-open"></i>
+        </div>
+        <div class="card">
+          <div><span>Return Overdue</span>
+            <h2 id="cardOverdue">0</h2>
+            <p>Past 7-day return window</p>
+          </div>
+          <i class="fa-solid fa-triangle-exclamation"></i>
+        </div>
+        <div class="card">
+          <div><span>Pending Requests</span>
+            <h2 id="cardPendingRequests">0</h2>
+            <p>Awaiting admin/employee approval</p>
+          </div>
+          <i class="fa-solid fa-hourglass-half"></i>
+        </div>
+        <div class="card">
+          <div><span>Rejected Requests</span>
+            <h2 id="cardRejectedRequests">0</h2>
+            <p>Declined by admin/employee</p>
+          </div>
+          <i class="fa-solid fa-circle-xmark"></i>
+        </div>
+      </section>
+
+      <div class="top-actions">
+        <button class="add-product"><i class="fa-solid fa-plus"></i> Request Demo Unit</button>
+      </div>
+
+      <section class="filter-section">
+        <div class="filter-box">
+          <i class="fa-solid fa-filter"></i>
+          <select id="statusFilter">
+            <option value="">All Status</option>
+            <option value="under_approval">Under Approval</option>
+            <option value="approved">Approved</option>
+            <option value="processing">Processing</option>
+            <option value="dispatched">Dispatched</option>
+            <option value="convert_pending">Order Request Pending</option>
+            <option value="return_pending">Return Pending Approval</option>
+            <option value="overdue">Overdue</option>
+            <option value="returned">Returned</option>
+            <option value="rejected">Rejected</option>
+          </select>
+        </div>
+        <button class="filter-btn"><i class="fa-solid fa-filter"></i> Apply Filter</button>
+      </section>
+
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Creator</th>
+              <th>Category</th>
+              <th>Remarks</th>
+              <th>Product(s)</th>
+              <th>Allotment Date</th>
+              <th>Return Due</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- rows rendered dynamically by distributor.js -->
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pagination">
+        <button class="page-btn"><i class="fa-solid fa-angle-left"></i></button>
+        <button class="page active-page">1</button>
+        <button class="page">2</button>
+        <button class="page-btn"><i class="fa-solid fa-angle-right"></i></button>
+      </div>
+    </main>
+
+  </div>
+
+  <!-- Logout Modal -->
+  <div id="logoutModal" class="logout-modal">
+    <div class="logout-box">
+      <i class="fa-solid fa-arrow-right-from-bracket logout-icon"></i>
+      <h2>Logout?</h2>
+      <p>Are you sure you want to logout from your account?</p>
+      <div class="logout-actions">
+        <button class="cancel-btn" onclick="closeLogoutModal()">Cancel</button>
+        <button class="confirm-btn" onclick="logoutNow()">Logout</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- common_auth.js MUST load first: enforces login + role-based page access -->
+  <script src="../common_auth.js"></script>
+
+  <!-- View Allocation Modal -->
+  <div id="viewAllocationModal" class="modal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
+    <div class="modal-content" style="background:#fff;border-radius:16px;padding:26px;width:440px;"></div>
+  </div>
+
+  <!-- Allot Demo Unit Modal (wizard built dynamically) -->
+  <div id="allotModal" class="modal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
+    <div class="modal-content"
+      style="background:#fff;border-radius:14px;padding:24px;width:460px;max-height:86vh;overflow-y:auto;"></div>
+  </div>
+
+  <script>
+    function openLogoutModal(e) {
+      e.preventDefault();
+      document.getElementById("logoutModal").classList.add("active");
+    }
+    function closeLogoutModal() {
+      document.getElementById("logoutModal").classList.remove("active");
+    }
+    document.addEventListener('DOMContentLoaded', () => {
+      const role = getRole() || '';
+      const uname = getUsername() || 'User';
+      const label = role.charAt(0).toUpperCase() + role.slice(1);
+      ['sidebarUserName', 'headerUserName'].forEach(id => document.getElementById(id).textContent = uname);
+      ['sidebarUserRole', 'headerUserRole'].forEach(id => document.getElementById(id).textContent = label);
+    });
+  </script>
+  <script src="distributor.js"></script>
+</body>
+
+</html>
