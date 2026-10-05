@@ -1,5 +1,5 @@
 {
-  "name": "acer-erp",
+  "name": "Endolax-erp",
   "version": "1.0.0",
   "main": "main.js",
   "scripts": {
@@ -7,8 +7,8 @@
   },
   "build": {
     "files": ["main.js", "package.json", "build/**/*"],
-    "appId": "com.acer.erp",
-    "productName": "Acer ERP",
+    "appId": "com.Endolax.erp",
+    "productName": "Endolax ERP",
     "icon": "build/icon.ico",
     "win": {
       "target": "nsis",
