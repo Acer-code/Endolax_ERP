@@ -8,10 +8,10 @@ const ROLE_ACCESS = {
   admin:           ['main_dashboard.html', 'orders.html', 'inventory.html', 'service.html', 'allocated.html', 'dispatch.html', 'shipment.html', 'assembly.html', 'users.html', 'reports.html', 'create_account.html', 'attendance.html'],
   accounts:        ['main_dashboard.html', 'orders.html', 'inventory.html', 'service.html', 'allocated.html', 'dispatch.html', 'shipment.html', 'assembly.html', 'reports.html'],
   service_manager: ['service.html', 'inventory.html', 'dispatch.html','allocated.html'],
-  assembly:        ['assembly.html'],
+  assembly:        ['assembly.html', 'inventory.html'],
   technician:      ['technician.html','technician_dashboard.html'],
   distributor:     ['distributor.html', 'distributor_orders.html', 'distributor_team.html','technician.html'],
-  inventory_manager: ['inventory.html'],
+  inventory_manager: ['inventory.html', 'distributor.html', 'distributor_orders.html', 'assembly.html', 'shipment.html'],
 };
 
 const ROLE_HOME = {
