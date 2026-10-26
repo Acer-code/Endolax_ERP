@@ -7,7 +7,7 @@ import uuid
 class assembly_manager(mongodbclient):
 
     def __init__(self, product_name=None, product_id=None, model_number=None, quantity=None,
-                 parts_used=None, serials=None, created_by=None, hologram_part=None):
+                 parts_used=None, serials=None, created_by=None, hologram_part=None, hologram_part_belongs_to=None):
         """
         product_name / product_id / model_number: what is being assembled
         quantity: int -> how many units of this product are being built in this batch
@@ -15,6 +15,7 @@ class assembly_manager(mongodbclient):
             {
                 "part_name": str,
                 "quantity": int,                    # total used for the whole batch
+                "belongs_to": str,                  # product the part belongs to
                 "source": "inventory" | "local",     # "inventory" -> deducted from inventory's
                                                       # spare_parts stock; "local" -> sourced
                                                       # outside, never touches inventory
@@ -42,6 +43,7 @@ class assembly_manager(mongodbclient):
         self.serials = serials or []
         self.created_by = created_by
         self.hologram_part = hologram_part
+        self.hologram_part_belongs_to = hologram_part_belongs_to or ""
 
     @staticmethod
     def _normalize_parts_used(parts_used):
@@ -57,6 +59,7 @@ class assembly_manager(mongodbclient):
                 "part_name": part_name,
                 "quantity": part.get("quantity", 0) or 0,
                 "source": source,
+                "belongs_to": (part.get("belongs_to") or "").strip(),
             })
         return normalized
 
@@ -67,6 +70,7 @@ class assembly_manager(mongodbclient):
             entry = {
                 "serial_number": (s.get("serial_number") or "").strip(),
                 "hologram_number": (s.get("hologram_number") or "").strip(),
+                "lot_no": (s.get("lot_no") or "").strip(),
             }
             if s.get("replaced"):
                 entry["replaced"] = True
@@ -88,6 +92,10 @@ class assembly_manager(mongodbclient):
                 raise Exception("number of serial/hologram entries must match the assembly quantity")
             if any(not s["serial_number"] or not s["hologram_number"] for s in serials):
                 raise Exception("every unit needs both a serial number and a hologram number")
+            # lot_no is compulsory per unit; one batch may carry several lot numbers, so no
+            # uniqueness / consistency check is made on it (unlike serial / hologram numbers)
+            if any(not s["lot_no"] for s in serials):
+                raise Exception("every unit needs a lot number")
 
             serial_values = [s["serial_number"] for s in serials]
             hologram_values = [s["hologram_number"] for s in serials]
@@ -106,6 +114,7 @@ class assembly_manager(mongodbclient):
                 "serials": serials,
                 "status": "pending",           # flips to "completed" via mark_completed()
                 "hologram_part": self.hologram_part,
+                "hologram_part_belongs_to": self.hologram_part_belongs_to,
                 "created_by": self.created_by,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
