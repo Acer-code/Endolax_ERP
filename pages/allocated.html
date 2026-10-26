@@ -8,6 +8,34 @@
 
   <link rel="stylesheet" href="../css/accure.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+  <link rel="stylesheet" href="../css/mobile-fold.css">
+  <!-- sidebar scrollbar -->
+  <style id="sidebar-scroll-fix">
+    .sidebar {
+      max-height: 100vh;
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(148, 163, 184, .6) transparent;
+    }
+
+    .sidebar::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    .sidebar::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .sidebar::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, .55);
+      border-radius: 999px;
+    }
+
+    .sidebar::-webkit-scrollbar-thumb:hover {
+      background: rgba(148, 163, 184, .9);
+    }
+  </style>
 </head>
 
 <body>
@@ -22,14 +50,14 @@
         <li><a href="../main_dashboard.html"><i class="fa-solid fa-house"></i><span>Dashboard</span></a></li>
         <li><a href="orders.html"><i class="fa-solid fa-cart-shopping"></i><span>Orders</span></a></li>
         <li><a href="inventory.html"><i class="fa-solid fa-boxes-stacked"></i><span>Inventory</span></a></li>
-                <li><a href="shipment.html"><i class="fa-solid fa-boxes-packing"></i><span>Shipment</span></a></li>
+        <li><a href="shipment.html"><i class="fa-solid fa-boxes-packing"></i><span>Shipment</span></a></li>
         <li><a href="assembly.html"><i class="fa-solid fa-gears"></i><span>Assembly</span></a></li>
 
         <li><a href="service.html"><i class="fa-solid fa-screwdriver-wrench"></i><span>Service</span></a></li>
         <li class="active"><a href="allocated.html"><i
               class="fa-solid fa-people-carry-box"></i><span>Allocated</span></a></li>
         <li><a href="dispatch.html"><i class="fa-solid fa-truck-fast"></i><span>Dispatch</span></a></li>
-                <li><a href="attendance.html"><i class="fa-solid fa-calendar-check"></i><span>Attendance</span></a></li>
+        <li><a href="attendance.html"><i class="fa-solid fa-calendar-check"></i><span>Attendance</span></a></li>
 
         <li><a href="users.html"><i class="fa-solid fa-users"></i><span>Users</span></a></li>
         <li><a href="reports.html"><i class="fa-solid fa-chart-column"></i><span>Reports</span></a></li>
@@ -66,7 +94,7 @@
             <span id="notifBadge"
               style="display:none;position:absolute;top:2px;right:2px;background:#d62828;color:#fff;font-size:10px;border-radius:999px;padding:1px 5px;">0</span>
           </div>
-          <button><i class="fa-regular fa-envelope"></i></button>
+          <button id="msgBtn"><i class="fa-regular fa-envelope"></i></button>
           <div class="profile">
             <img src="../images/admin.jpg" alt="Admin">
             <div>
@@ -78,7 +106,7 @@
       </header>
 
       <section class="cards">
-        <div class="card">
+        <div class="card" data-card-filter="all" style="cursor:pointer;">
           <div>
             <span>Total Allocations</span>
             <h2>0</h2>
@@ -86,7 +114,7 @@
           </div>
           <i class="fa-solid fa-layer-group"></i>
         </div>
-        <div class="card">
+        <div class="card" data-card-filter="pending" style="cursor:pointer;">
           <div>
             <span>Pending Return</span>
             <h2>0</h2>
@@ -94,7 +122,7 @@
           </div>
           <i class="fa-regular fa-clock"></i>
         </div>
-        <div class="card">
+        <div class="card" data-card-filter="overdue" style="cursor:pointer;">
           <div>
             <span>Overdue</span>
             <h2>0</h2>
@@ -102,7 +130,7 @@
           </div>
           <i class="fa-solid fa-triangle-exclamation"></i>
         </div>
-        <div class="card">
+        <div class="card" data-card-filter="returned" style="cursor:pointer;">
           <div>
             <span>Returned</span>
             <h2>0</h2>
@@ -110,11 +138,19 @@
           </div>
           <i class="fa-solid fa-circle-check"></i>
         </div>
+        <div class="card" data-card-filter="requests" style="cursor:pointer;">
+          <div>
+            <span>Pending Requests</span>
+            <h2 id="cardPendingRequests">0</h2>
+            <p>Awaiting review</p>
+          </div>
+          <i class="fa-solid fa-inbox"></i>
+        </div>
       </section>
 
       <!-- Pending demo-unit / spare-part / order / status requests -->
       <section class="dashboard-grid">
-        <div class="panel" id="pendingRequestsSection" style="width:175%; margin-bottom:5px;">
+        <div class="panel" id="pendingRequestsSection" style="width:100%; margin-bottom:5px;">
           <div class="panel-header">
             <h3>Pending Requests <span id="pendingCountLabel"></span></h3>
             <p style="color:#64748b;font-size:13px;">Demo units, spare parts, orders and status changes awaiting review
@@ -194,16 +230,13 @@
     </div>
   </div>
 
-  <!-- common_auth.js MUST load first: enforces login + role-based page access -->
   <script src="../common_auth.js"></script>
 
-  <!-- View Allocation Modal -->
   <div id="viewAllocationModal" class="modal"
     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
     <div class="modal-content" style="background:#fff;border-radius:16px;padding:26px;width:440px;"></div>
   </div>
 
-  <!-- Allocate Modal (wizard built dynamically by allocated.js) -->
   <div id="allocateModal" class="modal"
     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
     <div class="modal-content"
@@ -226,6 +259,13 @@
       ['sidebarUserRole', 'headerUserRole'].forEach(id => document.getElementById(id).textContent = label);
     });
   </script>
+  <div id="allocCardDetailModal" class="modal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);justify-content:center;align-items:center;z-index:999;">
+    <div class="modal-content"
+      style="background:#fff;border-radius:16px;padding:26px;width:min(960px,96vw);max-height:92vh;overflow-y:auto;">
+    </div>
+  </div>
+
   <script src="allocated.js"></script>
 </body>
 

@@ -1,14 +1,18 @@
 {
-  "name": "Endolax-erp",
+  "name": "ABM-erp",
   "version": "1.0.0",
   "main": "main.js",
   "scripts": {
     "dist": "electron-builder"
   },
   "build": {
-    "files": ["main.js", "package.json", "build/**/*"],
-    "appId": "com.Endolax.erp",
-    "productName": "Endolax ERP",
+    "files": [
+      "main.js",
+      "package.json",
+      "build/**/*"
+    ],
+    "appId": "com.ABM.erp",
+    "productName": "ABM ERP",
     "icon": "build/icon.ico",
     "win": {
       "target": "nsis",

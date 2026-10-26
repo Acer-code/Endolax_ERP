@@ -1,3 +1,9 @@
+/* ---- A4 print support: print_a4.js is loaded on demand (safe if it is missing) ---- */
+(function () { if (typeof A4Print === 'undefined' && !document.getElementById('a4printjs')) { const s = document.createElement('script'); s.id = 'a4printjs'; s.src = 'print_a4.js'; document.head.appendChild(s); } })();
+function a4Ready(cb, n) { n = n || 0; if (typeof A4Print !== 'undefined') return cb(); if (n < 50) setTimeout(() => a4Ready(cb, n + 1), 200); }
+function a4Intercept(head, rows, name) { return typeof A4Print !== 'undefined' && A4Print.intercept(head, rows, name); }
+function a4WizardPrint(modal, title) { if (typeof A4Print !== 'undefined') A4Print.wizardPrint(modal, title); }
+function a4Twin(btn, title) { if (btn) a4Ready(() => A4Print.attachTwin(btn, title)); }
 const orderState = { orders: [], activeOrderId: null };
 const invLookup = { products: [] };
 let ordersPage = 1;
@@ -55,6 +61,7 @@ async function loadOrders() {
     if (!res.ok) throw new Error('failed to fetch orders');
     const data = await res.json();
     orderState.orders = (data.dataset || []).slice().reverse();
+    orderState.currentBase = null;
     ordersPage = 1;
     renderOrdersTable(orderState.orders);
     updateCards(orderState.orders);
@@ -79,12 +86,12 @@ function updateCards(orders) {
 }
 
 function statusClass(status) {
-  const map = { placed: 'pending', delivered: 'delivered', cancelled: 'cancel', returned: 'cancel' };
+  const map = { placed: 'pending', dispatched: 'dispatched', delivered: 'delivered', cancelled: 'cancel', returned: 'cancel' };
   return map[status] || 'pending';
 }
 
 function statusLabel(status) {
-  const map = { placed: 'Pending', processing: 'Processing', delivered: 'Delivered', cancelled: 'Cancelled', returned: 'Returned' };
+  const map = { placed: 'Pending', processing: 'Processing', dispatched: 'Dispatched', delivered: 'Delivered', cancelled: 'Cancelled', returned: 'Returned' };
   return map[status] || status || '';
 }
 
@@ -111,16 +118,16 @@ function openOrderHistoryModal(o) {
   const entries = [];
 
   entries.push(`
-    <div style="border-left:3px solid #1665ff;padding-left:10px;">
+    <div style="border-left:3px solid var(--primary);padding-left:10px;">
       <strong>Created by ${escapeHtml(orderCreatorLabel(o))}</strong>
-      <div style="color:#94a3b8;font-size:12px;">${fmt(o.order_date)}</div>
+      <div style="color:var(--text-light);font-size:12px;">${fmt(o.order_date)}</div>
     </div>`);
 
   (o.edit_history || []).forEach(h => {
     entries.push(`
-      <div style="border-left:3px solid #f59e0b;padding-left:10px;">
+      <div style="border-left:3px solid var(--warning);padding-left:10px;">
         <strong>Edited by ${escapeHtml(h.edited_by)}</strong>
-        <div style="color:#94a3b8;font-size:12px;">${fmt(h.edited_at)}</div>
+        <div style="color:var(--text-light);font-size:12px;">${fmt(h.edited_at)}</div>
         <div style="margin-top:4px;">${escapeHtml(h.remark)}</div>
       </div>`);
   });
@@ -155,19 +162,17 @@ function renderOrdersTable(orders) {
     const productSubLabel = items.length === 1
       ? [firstItem.product_id, firstItem.model_no].filter(Boolean).join(' · ')
       : (items.length > 1 ? '' : [o.product_id, o.model_no].filter(Boolean).join(' · '));
-    const serialLabel = items.length
-      ? (items.length === 1
-          ? ((items[0].serial_numbers && items[0].serial_numbers.length) ? items[0].serial_numbers[0]: '-')
-          : `${items.length} items`)
-      : '-';
+    const qtyLabel = items.length
+      ? items.reduce((sum, it) => sum + (Number(it.quantity) || 0), 0)
+      : (o.quantity ?? '-');
     const companyName = o.customer?.contractor_person ?? o.customer?.company_name ?? o.company_name ?? '';
     const creatorLabel = orderCreatorLabel(o);
 
     tr.innerHTML = `
       <td><input type="checkbox"></td>
-      <td><button type="button" class="creator-cell" style="background:none;border:none;padding:0;color:#1665ff;cursor:pointer;font:inherit;text-align:left;" title="View who created and edited this order">${creatorLabel}</button></td>
-      <td>${productLabel}${productSubLabel ? `<br><small style="color:#94a3b8;">${productSubLabel}</small>` : ''}</td>
-      <td>${serialLabel}</td>
+      <td><button type="button" class="creator-cell" style="background:none;border:none;padding:0;color:var(--primary);cursor:pointer;font:inherit;text-align:left;" title="View who created and edited this order">${creatorLabel}</button></td>
+      <td>${productLabel}${productSubLabel ? `<br><small style="color:var(--text-light);">${productSubLabel}</small>` : ''}</td>
+      <td>${qtyLabel}</td>
       <td>${companyName}</td>
       <td>${o.payment_mode ?? ''}</td>
       <td>${o.order_date ? new Date(o.order_date).toLocaleDateString('en-GB') : '-'}</td>
@@ -219,7 +224,7 @@ function openOrderActionMenu(o, evt) {
     const b = document.createElement('button');
     b.textContent = item.label;
     b.style.cssText = 'display:block;width:100%;text-align:left;padding:9px 12px;border:none;background:none;border-radius:6px;cursor:pointer;font-size:14px;';
-    b.onmouseenter = () => b.style.background = '#f1f5f9';
+    b.onmouseenter = () => b.style.background = 'var(--bg-hover)';
     b.onmouseleave = () => b.style.background = 'none';
     b.addEventListener('click', () => { closeOrderActionMenu(); item.action(); });
     menu.appendChild(b);
@@ -362,55 +367,56 @@ function openEditOrderModal(o) {
     </div>
     <form id="editOrderForm" style="display:flex;flex-direction:column;gap:14px;">
       <div id="editItemsBox" style="display:flex;flex-direction:column;gap:10px;max-height:320px;overflow-y:auto;"></div>
-      <div style="border-top:1px solid #e2e8f0;padding-top:12px;display:flex;flex-direction:column;gap:10px;">
-        <input name="company_name" placeholder="Company Name" value="${customer.company_name ?? ''}" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;">
-        <input name="gst_number" placeholder="GST Number" value="${customer.gst_number ?? ''}" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;">
-        <input name="discount" type="number" min="0" placeholder="Discount" value="${o.discount ?? 0}" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;">
-        <select name="payment_mode" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;">
-          ${PAYMENT_MODES.map(m => `<option value="${m.value}" ${m.value === o.payment_mode ? 'selected' : ''}>${m.label}</option>`).join('')}
+      <div style="border-top:1px solid var(--border);padding-top:12px;display:flex;flex-direction:column;gap:10px;">
+        <input name="company_name" placeholder="Company Name" value="${customer.company_name ?? ''}" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">
+        <input name="gst_number" placeholder="GST Number" value="${customer.gst_number ?? ''}" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">
+        <input name="discount" type="number" min="0" placeholder="Discount" value="${o.discount ?? 0}" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">
+        <select name="payment_mode" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">
+          ${PAYMENT_MODES.filter(m => m.value !== 'Partial' || o.payment_mode === 'Partial')
+      .map(m => `<option value="${m.value}" ${m.value === o.payment_mode ? 'selected' : ''}>${m.label}</option>`).join('')}
         </select>
         <textarea name="remark" class="edit-remark" placeholder="Remark for this edit (required)" rows="2" required
-          style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;resize:vertical;"></textarea>
+          style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;resize:vertical;"></textarea>
       </div>
       <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:4px;">
-        <button type="button" class="cancel-btn" style="padding:10px 16px;border:none;border-radius:8px;background:#eee;cursor:pointer;">Cancel</button>
-        <button type="submit" style="padding:10px 16px;border:none;border-radius:8px;background:#1665ff;color:#fff;cursor:pointer;">Save</button>
+        <button type="button" class="cancel-btn" style="padding:10px 16px;border:none;border-radius:8px;background:var(--border);cursor:pointer;">Cancel</button>
+        <button type="submit" style="padding:10px 16px;border:none;border-radius:8px;background:var(--primary);color:#fff;cursor:pointer;">Save</button>
       </div>
     </form>`;
 
   const itemsBox = content.querySelector('#editItemsBox');
   itemsBox.innerHTML = items.map((it, idx) => `
-    <div class="editItemRow" data-idx="${idx}" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;">
+    <div class="editItemRow" data-idx="${idx}" style="border:1px solid var(--border);border-radius:8px;padding:10px;">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px;">
         <div style="font-size:13px;font-weight:600;">
           ${it.product_name ?? ''}
-          <small style="color:#94a3b8;font-weight:400;">${[it.product_id, it.model_no].filter(Boolean).join(' · ')}</small>
+          <small style="color:var(--text-light);font-weight:400;">${[it.product_id, it.model_no].filter(Boolean).join(' · ')}</small>
         </div>
         <button type="button" class="removeItemBtn" title="Remove this product from the order"
-          style="border:none;background:none;color:#d62828;cursor:pointer;font-size:14px;padding:2px 4px;">
+          style="border:none;background:none;color:var(--danger);cursor:pointer;font-size:14px;padding:2px 4px;">
           <i class="fa-solid fa-trash"></i>
         </button>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <label style="font-size:11px;color:#64748b;width:70px;">Qty
-          <input type="number" min="1" class="editQty" value="${it.quantity ?? 1}" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:6px;">
+        <label style="font-size:11px;color:var(--text-muted);width:70px;">Qty
+          <input type="number" min="1" class="editQty" value="${it.quantity ?? 1}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;">
         </label>
-        <label style="font-size:11px;color:#64748b;width:100px;">Price
-          <input type="number" min="0" class="editPrice" value="${it.price ?? 0}" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:6px;">
+        <label style="font-size:11px;color:var(--text-muted);width:100px;">Price
+          <input type="number" min="0" class="editPrice" value="${it.price ?? 0}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;">
         </label>
-        <label style="font-size:11px;color:#64748b;width:80px;">Tax %
-          <input type="number" min="0" class="editTax" value="${it.tax_rate ?? 0}" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:6px;">
+        <label style="font-size:11px;color:var(--text-muted);width:80px;">Tax %
+          <input type="number" min="0" class="editTax" value="${it.tax_rate ?? 0}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;">
         </label>
       </div>
-      <label style="font-size:11px;color:#64748b;display:block;margin-top:8px;">Serial Numbers (comma separated)
-        <input class="editSerials" placeholder="e.g. SN001, SN002" value="${(it.serial_numbers || []).join(', ')}" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:6px;">
+      <label style="font-size:11px;color:var(--text-muted);display:block;margin-top:8px;">Serial Numbers (comma separated)
+        <input class="editSerials" placeholder="e.g. SN001, SN002" value="${(it.serial_numbers || []).join(', ')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;">
       </label>
       <div style="margin-top:6px;display:flex;align-items:center;gap:8px;">
-        <button type="button" class="editSerialFileBtn" style="padding:6px 10px;border:1px dashed #94a3b8;border-radius:6px;background:none;cursor:pointer;font-size:11px;color:#64748b;">
+        <button type="button" class="editSerialFileBtn" style="padding:6px 10px;border:1px dashed var(--text-light);border-radius:6px;background:none;cursor:pointer;font-size:11px;color:var(--text-muted);">
           <i class="fa-solid fa-file-arrow-up"></i> Upload serials from Excel/CSV
         </button>
         <input type="file" class="editSerialFileInput" accept=".xlsx,.xls,.csv" style="display:none;">
-        <span class="editSerialFilePreview" style="font-size:11px;color:#0369a1;"></span>
+        <span class="editSerialFilePreview" style="font-size:11px;color:var(--primary-dark);"></span>
       </div>
     </div>`).join('');
 
@@ -457,7 +463,7 @@ function openEditOrderModal(o) {
         if (qtyInput) qtyInput.value = serials.length;
         preview.textContent = `${serials.length} serial number(s) loaded from file.`;
         fileInput.value = '';
-      }, (msg) => { preview.textContent = msg; preview.style.color = '#d62828'; fileInput.value = ''; });
+      }, (msg) => { preview.textContent = msg; preview.style.color = 'var(--danger)'; fileInput.value = ''; });
     });
   });
 
@@ -575,20 +581,20 @@ function renderReturnItemsBox(box, o) {
   box.innerHTML = items.map((it, idx) => {
     const serials = it.serial_numbers || [];
     return `
-    <div class="returnItemRow" data-idx="${idx}" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;">
+    <div class="returnItemRow" data-idx="${idx}" style="border:1px solid var(--border);border-radius:8px;padding:10px;">
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;">
         <input type="checkbox" class="returnItemCheck">
-        ${it.product_name ?? ''} <small style="color:#94a3b8;font-weight:400;">(qty ${it.quantity ?? 0})</small>
+        ${it.product_name ?? ''} <small style="color:var(--text-light);font-weight:400;">(qty ${it.quantity ?? 0})</small>
       </label>
       <div class="returnItemDetails" style="display:none;margin-top:8px;padding-left:22px;">
         ${serials.length ? `
-        <p style="font-size:11px;color:#64748b;margin-bottom:4px;">Which unit(s) came back?</p>
+        <p style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">Which unit(s) came back?</p>
         ${serials.map(sn => `
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:4px;">
             <input type="checkbox" class="returnSerialCheck" value="${sn}"> ${sn}
           </label>`).join('')}
         ` : ''}
-        <p style="font-size:11px;color:#64748b;margin:6px 0 4px;">Condition</p>
+        <p style="font-size:11px;color:var(--text-muted);margin:6px 0 4px;">Condition</p>
         <div style="display:flex;gap:14px;font-size:12px;">
           <label><input type="radio" name="condition-${idx}" class="returnConditionOk" value="ok" checked> OK — restock</label>
           <label><input type="radio" name="condition-${idx}" class="returnConditionFaulty" value="faulty"> Faulty — mark damaged</label>
@@ -702,26 +708,88 @@ function wireCardFilters() {
   });
 }
 
+// ---------- Shared product helpers (cards + view modal) ----------
+const ITEM_TYPE_LABELS = { spare_parts: 'Spare Part', service_parts: 'Service Part', accessories: 'Accessory' };
+const orderMoney = n => '₹' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+const orderDate = d => d ? new Date(d).toLocaleDateString('en-GB') : '-';
+
+// Order items only store id/name/model, so for parts we look the lot up in
+// inventory to find out what kind of item it is and which product it belongs to.
+function itemMeta(it) {
+  const list = invLookup.products || [];
+  const id = (it.product_id || '').trim();
+  const model = it.model_no || '';
+  const inv = list.find(p => id && p.product_id === id && (p.model_no || '') === model)
+    || (id && list.find(p => p.product_id === id))
+    || list.find(p => p.product_name === it.product_name && p.product_type && p.product_type !== 'product');
+  const type = it.product_type || inv?.product_type || 'product';
+  const parent = it.parent_product_name || it.belongs_to || inv?.parent_product_name || '';
+  return { type, typeLabel: ITEM_TYPE_LABELS[type] || '', parent };
+}
+
+// Product name, then "ID · Model", then (for parts) the part type + which product it belongs to
+function productCellHtml(it) {
+  const m = itemMeta(it);
+  const sub = [it.product_id ? `ID: ${escapeHtml(it.product_id)}` : '', it.model_no ? `Model: ${escapeHtml(it.model_no)}` : ''].filter(Boolean).join(' · ');
+  const part = m.typeLabel
+    ? `<div style="margin-top:3px;"><span class="ov-chip">${m.typeLabel}</span>${m.parent ? ` <span class="ov-sub">belongs to: <strong style="color:var(--text-secondary);">${escapeHtml(m.parent)}</strong></span>` : ''}</div>`
+    : '';
+  return `<strong>${escapeHtml(it.product_name ?? '')}</strong>${sub ? `<div class="ov-sub">${sub}</div>` : ''}${part}`;
+}
+
+function ensureOrderViewStyles() {
+  if (document.getElementById('ov-style')) return;
+  const st = document.createElement('style');
+  st.id = 'ov-style';
+  st.textContent = `
+    .ov-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+    .ov-head h3{margin:0 0 4px}
+    .ov-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 14px;margin-bottom:18px}
+    .ov-cell{background:var(--bg-light);border-radius:10px;padding:10px 12px}
+    .ov-cell small{display:block;color:var(--text-muted);font-size:11px;margin-bottom:2px}
+    .ov-cell p{margin:0;font-size:14px;color:var(--text-primary);word-break:break-word}
+    .ov-title{font-size:13px;font-weight:600;color:var(--text-secondary);margin:4px 0 8px}
+    .ov-scroll{overflow-x:auto;margin-bottom:18px;border:1px solid var(--border);border-radius:10px}
+    .ov-table{width:100%;border-collapse:collapse;font-size:13px}
+    .ov-table th{background:var(--bg-hover);color:var(--text-secondary);text-align:left;padding:9px 12px;font-weight:600;white-space:nowrap}
+    .ov-table td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+    .ov-table tr:last-child td{border-bottom:none}
+    .ov-sub{color:var(--text-light);font-size:12px}
+    .ov-chip{display:inline-block;background:var(--info-bg);color:var(--primary);border-radius:999px;padding:1px 9px;font-size:11px;font-weight:600}
+    .ov-serial{display:inline-block;background:var(--bg-hover);border-radius:6px;padding:1px 7px;margin:2px 4px 0 0;font-size:11px;color:var(--text-secondary)}
+    .ov-bottom{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start}
+    .ov-notes{flex:1;min-width:260px;display:grid;gap:10px}
+    .ov-totals{width:300px;max-width:100%;background:var(--bg-light);border-radius:12px;padding:12px 16px;margin-left:auto}
+    .ov-totals div{display:flex;justify-content:space-between;padding:5px 0;font-size:14px;color:var(--text-secondary)}
+    .ov-totals .ov-grand{border-top:1px solid var(--border);margin-top:4px;padding-top:9px;font-weight:700;font-size:16px;color:var(--text-primary)}
+    .ov-row{cursor:pointer}
+    .ov-row:hover td{background:var(--bg-light)}
+    .ov-hint{font-size:12px;color:var(--text-light);margin:-8px 0 12px}`;
+  document.head.appendChild(st);
+}
+
 function orderCardRowsHtml(list) {
-  if (!list.length) return '<p style="color:#94a3b8;text-align:center;padding:16px;">No orders to show.</p>';
-  return `<table style="width:100%;font-size:13px;border-collapse:collapse;">
-    <thead><tr style="text-align:left;">
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Order ID</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Product</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Company</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Order Date</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Status</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Amount</th>
-    </tr></thead>
-    <tbody>${list.map(o => `<tr>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${(o.order_id || '').slice(0, 8)}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${escapeHtml(o.product_name ?? '')}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${escapeHtml(o.customer?.company_name ?? o.company_name ?? '')}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${o.order_date ? new Date(o.order_date).toLocaleDateString('en-GB') : '-'}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${statusLabel(o.status)}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">₹${o.total_mrp ?? o.price ?? 0}</td>
-    </tr>`).join('')}</tbody>
-  </table>`;
+  ensureOrderViewStyles();
+  if (!list.length) return '<p style="color:var(--text-light);text-align:center;padding:16px;">No orders to show.</p>';
+  return `<p class="ov-hint">Click an order to see its full details.</p>
+  <div class="ov-scroll"><table class="ov-table">
+    <thead><tr><th>Product</th><th>Qty</th><th>Company</th><th>Order Date</th><th>Status</th><th>Amount</th></tr></thead>
+    <tbody>${list.map((o, i) => {
+    const items = o.items || [];
+    const qty = items.length ? items.reduce((s, it) => s + (Number(it.quantity) || 0), 0) : (o.quantity ?? '-');
+    const prod = items.length
+      ? items.map(it => `<div style="margin-bottom:6px;">${productCellHtml(it)}</div>`).join('')
+      : `<strong>${escapeHtml(o.product_name ?? '')}</strong>`;
+    return `<tr class="ov-row" data-i="${i}">
+        <td>${prod}</td>
+        <td>${qty}</td>
+        <td>${escapeHtml(o.customer?.company_name ?? o.company_name ?? '')}</td>
+        <td>${orderDate(o.order_date)}</td>
+        <td><span class="${statusClass(o.status)}">${statusLabel(o.status)}</span></td>
+        <td>${orderMoney(o.total_mrp ?? o.price)}</td>
+      </tr>`;
+  }).join('')}</tbody>
+  </table></div>`;
 }
 
 function ensureOrderCardDetailModal() {
@@ -740,6 +808,7 @@ function ensureOrderCardDetailModal() {
 function openOrderCardDetailModal(type) {
   const modal = ensureOrderCardDetailModal();
   const content = modal.querySelector('.modal-content');
+  content.style.width = 'min(900px, 95vw)';
   const orders = orderState.orders;
   const statusMap = { Pending: 'placed', Delivered: 'delivered', Cancelled: 'cancelled' };
 
@@ -756,11 +825,13 @@ function openOrderCardDetailModal(type) {
 
   content.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-      <h3>${title}</h3>
+      <h3>${title} <small style="color:var(--text-light);font-weight:400;">(${list.length})</small></h3>
       <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
     </div>
     ${orderCardRowsHtml(list)}`;
   content.querySelector('.close').addEventListener('click', () => modal.style.display = 'none');
+  content.querySelectorAll('tr.ov-row').forEach(tr =>
+    tr.addEventListener('click', () => openViewOrderModal(list[Number(tr.dataset.i)])));
   modal.style.display = 'flex';
 }
 
@@ -776,7 +847,7 @@ function wireFilter() {
     const paymentVal = selects[1]?.value || '';
     const dateVal = dateInput?.value || '';
 
-    const statusMap = { 'Pending': 'placed', 'Processing': 'processing', 'Delivered': 'delivered', 'Cancelled': 'cancelled', 'Returned': 'returned' };
+    const statusMap = { 'Pending': 'placed', 'Processing': 'processing', 'Dispatched': 'dispatched', 'Delivered': 'delivered', 'Cancelled': 'cancelled', 'Returned': 'returned' };
     const wantedStatus = statusMap[statusVal];
 
     const filtered = orderState.orders.filter(o => {
@@ -795,15 +866,22 @@ function wireFilter() {
 function exportOrdersCSV() {
   openExportWizard({
     title: 'Export Orders',
-    statusOptions: ['placed', 'processing', 'delivered', 'cancelled', 'returned'],
+    statusOptions: ['placed', 'processing', 'dispatched', 'delivered', 'cancelled', 'returned'],
     dateField: 'order_date',
     dateLabel: 'Order Date',
-    getRows: () => orderState.orders,
+    getRows: () => applySort(orderState.currentBase || orderState.orders),
     onConfirm: (rows) => {
-      const header = ['Order ID', 'Products', 'Company', 'Payment Mode', 'Status', 'Total'];
+      const header = ['Order ID', 'Order Date', 'Products', 'Qty', 'Serial Numbers', 'Company', 'Payment Mode', 'Status', 'Total'];
       const csvRows = rows.map(o => [
         o.order_id,
+        o.order_date ? new Date(o.order_date).toLocaleDateString('en-GB') : '',
         (o.items || []).map(it => `${it.product_name} x${it.quantity}`).join(' | '),
+        (o.items || []).reduce((t, it) => t + (Number(it.quantity) || 0), 0),
+        (o.items || []).map(it => {
+          const sn = (it.serial_numbers || []).join('; ');
+          if (!sn) return '';
+          return (o.items || []).length > 1 ? `${it.product_name}: ${sn}` : sn;
+        }).filter(Boolean).join(' | '),
         o.customer?.company_name ?? o.company_name ?? '',
         o.payment_mode,
         o.status,
@@ -816,7 +894,9 @@ function exportOrdersCSV() {
 
 // ---------- Generic export filter wizard (status + date range, then CSV of only the matching rows) ----------
 function downloadCSV(header, rows, filename) {
-  const csv = [header, ...rows].map(r => r.join(',')).join('\n');
+  if (a4Intercept(header, rows, filename)) return;
+  const q = v => { const t = String(v ?? ''); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+  const csv = '\ufeff' + [header, ...rows].map(r => r.map(q).join(',')).join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -839,25 +919,27 @@ function openExportWizard({ title, statusOptions, dateField, dateLabel, getRows,
         <h3>${title}</h3>
         <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
       </div>
+      <p style="font-size:12px;color:var(--text-muted);margin:-6px 0 12px;">${getRows().length} record(s) match the filters currently applied on this page. The options below narrow it further.</p>
       <form id="exportWizardForm" style="display:flex;flex-direction:column;gap:10px;">
         ${statusOptions ? `
-        <label style="font-size:13px;color:#64748b;">Status</label>
-        <select name="status" style="padding:10px;border:1px solid #e2e8f0;border-radius:8px;">
+        <label style="font-size:13px;color:var(--text-muted);">Status</label>
+        <select name="status" style="padding:10px;border:1px solid var(--border);border-radius:8px;">
           <option value="">All Statuses</option>
           ${statusOptions.map(s => `<option value="${s}">${s.replace('_', ' ')}</option>`).join('')}
         </select>` : ''}
         ${dateField ? `
-        <label style="font-size:13px;color:#64748b;">${dateLabel || 'Date'} From</label>
+        <label style="font-size:13px;color:var(--text-muted);">${dateLabel || 'Date'} From</label>
         <input type="date" name="dateFrom">
-        <label style="font-size:13px;color:#64748b;">${dateLabel || 'Date'} To</label>
+        <label style="font-size:13px;color:var(--text-muted);">${dateLabel || 'Date'} To</label>
         <input type="date" name="dateTo">` : ''}
         <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:10px;">
-          <button type="button" class="cancel-btn" style="padding:10px 16px;border:none;border-radius:8px;background:#eee;cursor:pointer;">Cancel</button>
-          <button type="submit" style="padding:10px 16px;border:none;border-radius:8px;background:#1665ff;color:#fff;cursor:pointer;">Export</button>
+          <button type="button" class="cancel-btn" style="padding:10px 16px;border:none;border-radius:8px;background:var(--border);cursor:pointer;">Cancel</button>
+          <button type="submit" style="padding:10px 16px;border:none;border-radius:8px;background:var(--primary);color:#fff;cursor:pointer;">Export</button>
         </div>
       </form>
     </div>`;
 
+  a4WizardPrint(modal, title);
   modal.querySelector('.close').addEventListener('click', () => modal.style.display = 'none');
   modal.querySelector('.cancel-btn').addEventListener('click', () => modal.style.display = 'none');
   modal.addEventListener('click', e => { if (e.target === modal) modal.style.display = 'none'; });
@@ -892,6 +974,10 @@ function paymentDetailsLabel(o) {
   const mode = o.payment_mode;
   const d = o.payment_details || {};
   if (mode === 'Credit') return `Credit — ${d.credit_days ?? '-'} days`;
+  if (mode === 'Partial') {
+    const inr = n => '₹' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    return `Partial — ${inr(d.paid_amount)} paid, ${inr(d.balance_amount)} due in ${d.credit_days ?? '-'} days${d.due_date ? ' (by ' + d.due_date + ')' : ''}`;
+  }
   if (mode === 'Cheque') return `Cheque #${d.cheque_number ?? '-'} (${d.cheque_date ?? '-'})${d.bank_name ? ', ' + d.bank_name : ''}`;
   if (mode === 'DemandDraft') return `DD #${d.dd_number ?? '-'} (${d.dd_date ?? '-'})${d.bank_name ? ', ' + d.bank_name : ''}`;
   if (mode === 'UPI') return `UPI — ${d.upi_id ?? '-'}`;
@@ -904,71 +990,102 @@ function openViewOrderModal(o) {
   if (!o) return;
   const modal = document.getElementById('viewOrderModal');
   if (!modal) return;
+  ensureOrderViewStyles();
+  modal.style.zIndex = 1100;           // always above the card list popup
   const content = modal.querySelector('.modal-content');
+  content.style.cssText = 'background:#fff;border-radius:16px;padding:26px;width:min(1000px,95vw);max-height:90vh;overflow-y:auto;';
   const items = o.items || [];
   const customer = o.customer || {};
+  const d = o.dispatch || null;
+  const cell = (label, val) => `<div class="ov-cell"><small>${label}</small><p>${val || '-'}</p></div>`;
+  const e = escapeHtml;
 
   const itemsRows = items.length
     ? items.map(it => {
-        const idModel = [it.product_id, it.model_no].filter(Boolean).join(' · ');
-        return `<tr>
-        <td>${it.product_name ?? ''}${idModel ? `<br><small style="color:#94a3b8;">${idModel}</small>` : ''}${it.serial_numbers?.length ? `<br><small style="color:#94a3b8;">${it.serial_numbers.join(', ')}</small>` : ''}</td>
-        <td>${it.quantity ?? 0}</td>
-        <td>₹${it.price ?? 0}</td>
-        <td>${it.tax_rate ?? 0}%</td>
-        <td>₹${(it.line_total ?? ((it.price || 0) * (it.quantity || 0))).toFixed ? (it.line_total ?? ((it.price || 0) * (it.quantity || 0))).toFixed(2) : it.line_total}</td>
-      </tr>`;
-      }).join('')
-    : `<tr><td colspan="5" style="text-align:center;color:#94a3b8;">No items</td></tr>`;
+      const lineTotal = it.line_total ?? ((it.price || 0) * (it.quantity || 0));
+      const serials = (it.serial_numbers || []).map(s => `<span class="ov-serial">${e(s)}</span>`).join('');
+      return `<tr>
+          <td>${productCellHtml(it)}</td>
+          <td>${serials || '<span class="ov-sub">—</span>'}</td>
+          <td>${it.quantity ?? 0}</td>
+          <td>${orderMoney(it.price)}</td>
+          <td>${it.tax_rate ?? 0}%</td>
+          <td><strong>${orderMoney(lineTotal)}</strong></td>
+        </tr>`;
+    }).join('')
+    : `<tr><td colspan="6" style="text-align:center;color:var(--text-light);">No items</td></tr>`;
 
-  content.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-      <h3>Order Details</h3>
-      <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
-    </div>
-    <div class="detail"><small>Order ID</small><p>${o.order_id ?? ''}</p></div>
-    <div class="detail"><small>Company</small><p>${customer.company_name ?? '-'}</p></div>
-    <div class="detail"><small>GST Number</small><p>${customer.gst_number ?? '-'}</p></div>
-    <div class="detail"><small>Contact name and number </small><p>${customer.contractor_person ?? '-'} (${customer.contractor_number ?? '-'})</p></div>
-    <table style="width:100%;font-size:13px;margin:10px 0;border-collapse:collapse;">
-      <thead><tr style="text-align:left;color:#fff;">
-        <th>Product</th><th>Qty</th><th>Price</th><th>Tax</th><th>Line Total</th>
-      </tr></thead>
-      <tbody>${itemsRows}</tbody>
-    </table>
-    ${(o.spare_parts || []).length ? `
-    <div class="detail"><small>Spare Parts</small></div>
-    <table style="width:100%;font-size:13px;margin:0 0 10px;border-collapse:collapse;">
-      <thead><tr style="text-align:left;color:#fff;">
-        <th>Name</th><th>Qty</th><th>Price</th>
-      </tr></thead>
-      <tbody>${o.spare_parts.map(sp => `<tr>
-        <td>${sp.name ?? ''}</td><td>${sp.quantity ?? 0}</td><td>₹${sp.price ?? 0}</td>
-      </tr>`).join('')}</tbody>
-    </table>` : ''}
-    <div class="detail"><small>Payment</small><p>${paymentDetailsLabel(o)}</p></div>
-    <div class="detail"><small>Status</small><p>${statusLabel(o.status)}</p></div>
-    <div class="detail"><small>Cancellation Reason</small><p>${o.status === 'cancelled' ? (o.cancel_reason || '-') : '-'}</p></div>
-    <div class="detail"><small>Return Reason</small><p>${o.status === 'returned' ? (o.return_reason || '-') : '-'}</p></div>
-    ${(o.returned_items || []).length ? `
-    <div class="detail"><small>Returned Product(s)</small></div>
-    <table style="width:100%;font-size:13px;margin:0 0 10px;border-collapse:collapse;">
-      <thead><tr style="text-align:left;color:#fff;">
-        <th>Product</th><th>Serial No(s)</th><th>Qty</th><th>Condition</th>
-      </tr></thead>
+  const returnedHtml = (o.returned_items || []).length ? `
+    <div class="ov-title">Returned Product(s)</div>
+    <div class="ov-scroll"><table class="ov-table">
+      <thead><tr><th>Product</th><th>Serial No(s)</th><th>Qty</th><th>Condition</th></tr></thead>
       <tbody>${o.returned_items.map(r => `<tr>
-        <td>${r.product_name ?? ''}${r.model_no ? `<br><small style="color:#94a3b8;">${r.model_no}</small>` : ''}</td>
-        <td>${(r.serial_numbers && r.serial_numbers.length) ? r.serial_numbers.join(', ') : '—'}</td>
+        <td>${productCellHtml(r)}</td>
+        <td>${(r.serial_numbers && r.serial_numbers.length) ? r.serial_numbers.map(s => `<span class="ov-serial">${e(s)}</span>`).join('') : '—'}</td>
         <td>${r.quantity ?? 0}</td>
         <td><span class="${r.condition === 'faulty' ? 'cancel' : 'delivered'}">${r.condition === 'faulty' ? 'Faulty' : 'OK'}</span></td>
       </tr>`).join('')}</tbody>
-    </table>` : ''}
-    <div class="detail"><small>Remark</small><p>${o.status === 'placed' ? (o.remark || '-') : '-'}</p></div>
-    <div class="detail"><small>Warranty</small><p>${(o.warranty_years ?? 1) > 1 ? `${o.warranty_years} Years (Extended, +₹${o.warranty_charge ?? 0})` : 'Standard (1 Year)'}</p></div>
-    <div class="detail"><small>Subtotal / Tax / Discount</small><p>₹${o.subtotal ?? 0} / ₹${(o.tax_total ?? 0).toFixed ? o.tax_total.toFixed(2) : o.tax_total} / ₹${o.discount ?? 0}</p></div>
-    <div class="detail"><small>Total Amount</small><p>₹${o.total_mrp ?? 0}</p></div>`;
+    </table></div>` : '';
+
+  const sparePartsHtml = (o.spare_parts || []).length ? `
+    <div class="ov-title">Spare Parts</div>
+    <div class="ov-scroll"><table class="ov-table">
+      <thead><tr><th>Name</th><th>Qty</th><th>Price</th></tr></thead>
+      <tbody>${o.spare_parts.map(sp => `<tr><td>${e(sp.name ?? '')}${sp.belongs_to ? `<div class="ov-sub">belongs to: ${e(sp.belongs_to)}</div>` : ''}</td><td>${sp.quantity ?? 0}</td><td>${orderMoney(sp.price)}</td></tr>`).join('')}</tbody>
+    </table></div>` : '';
+
+  const notes = [
+    o.status === 'cancelled' ? cell('Cancellation Reason', e(o.cancel_reason || '')) : '',
+    o.status === 'returned' ? cell('Return Reason', e(o.return_reason || '')) : '',
+    o.status === 'placed' && o.remark ? cell('Remark', e(o.remark)) : ''
+  ].join('');
+
+  content.innerHTML = `
+    <div class="ov-head">
+      <div>
+        <h3>Order Details</h3>
+        <span class="ov-sub">Order ID: ${e(o.order_id ?? '')}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="${statusClass(o.status)}">${statusLabel(o.status)}</span>
+        <button class="close" style="border:none;background:none;font-size:22px;cursor:pointer;">&times;</button>
+      </div>
+    </div>
+
+    <div class="ov-grid">
+      ${cell('Company', e(customer.company_name ?? ''))}
+      ${cell('GST Number', e(customer.gst_number ?? ''))}
+      ${cell('Contact', e([customer.contractor_person, customer.contractor_number].filter(Boolean).join(' · ')))}
+      ${cell('Order Date', orderDate(o.order_date))}
+      ${cell('Payment', e(paymentDetailsLabel(o)))}
+      ${cell('Reference', e(o.reference || o.creator?.raised_by || ''))}
+      ${cell('Created By', e(orderCreatorLabel(o)))}
+      ${cell('Warranty', (o.warranty_years ?? 1) > 1 ? `${o.warranty_years} Years (Extended, +${orderMoney(o.warranty_charge)})` : 'Standard (1 Year)')}
+      ${d ? cell('Invoice', e([d.invoice_no, d.invoice_date].filter(Boolean).join(' · '))) : ''}
+      ${d ? cell('Docket / Delivery', e([d.docket_no, d.mode_of_delivery].filter(Boolean).join(' · '))) : ''}
+    </div>
+
+    <div class="ov-title">Products</div>
+    <div class="ov-scroll"><table class="ov-table">
+      <thead><tr><th>Product</th><th>Serial No(s)</th><th>Qty</th><th>Price</th><th>Tax</th><th>Line Total</th></tr></thead>
+      <tbody>${itemsRows}</tbody>
+    </table></div>
+
+    ${sparePartsHtml}
+    ${returnedHtml}
+
+    <div class="ov-bottom">
+      <div class="ov-notes">${notes}</div>
+      <div class="ov-totals">
+        <div><span>Subtotal</span><span>${orderMoney(o.subtotal)}</span></div>
+        <div><span>Tax</span><span>${orderMoney(o.tax_total)}</span></div>
+        <div><span>Discount</span><span>- ${orderMoney(o.discount)}</span></div>
+        <div class="ov-grand"><span>Total Amount</span><span>${orderMoney(o.total_mrp)}</span></div>
+      </div>
+    </div>`;
 
   content.querySelector('.close').addEventListener('click', () => modal.style.display = 'none');
+  modal.onclick = ev => { if (ev.target === modal) modal.style.display = 'none'; };
   modal.style.display = 'flex';
 }
 
@@ -1056,6 +1173,7 @@ const wiz = {
   cart: {},             // product_id -> {product_id, product_name, price, tax_rate, quantity}
   paymentMode: '',
   paymentDetails: {},
+  reference: '',
   discount: 0,
   warrantyYears: 1,
   warrantyCharge: 0,
@@ -1064,6 +1182,7 @@ const wiz = {
 
 const PAYMENT_MODES = [
   { value: 'Credit', label: 'Credit' },
+  { value: 'Partial', label: 'Partial (part now, rest later)' },
   { value: 'NetBanking', label: 'Net Banking' },
   { value: 'UPI', label: 'UPI' },
   { value: 'Cheque', label: 'Cheque' },
@@ -1077,6 +1196,7 @@ function resetWizard() {
   wiz.cart = {};
   wiz.paymentMode = '';
   wiz.paymentDetails = {};
+  wiz.reference = '';
   wiz.discount = 0;
   wiz.warrantyYears = 1;
   wiz.warrantyCharge = 0;
@@ -1112,12 +1232,12 @@ function wizardTitle(t) { document.getElementById('wizardTitle').textContent = t
 function renderCustomerTypeStep() {
   wizardTitle('New Order — Customer');
   wizardBody().innerHTML = `
-    <p style="color:#64748b;margin-bottom:14px;">Is this order for an existing customer or a new one?</p>
+    <p style="color:var(--text-muted);margin-bottom:14px;">Is this order for an existing customer or a new one?</p>
     <div style="display:flex;gap:10px;">
-      <button id="btnExisting" style="flex:1;padding:16px;border-radius:10px;border:1px solid #e2e8f0;background:#f8fafc;cursor:pointer;">
+      <button id="btnExisting" style="flex:1;padding:16px;border-radius:10px;border:1px solid var(--border);background:var(--bg-light);cursor:pointer;">
         <i class="fa-solid fa-address-book"></i><br>Existing Customer
       </button>
-      <button id="btnNew" style="flex:1;padding:16px;border-radius:10px;border:1px solid #e2e8f0;background:#f8fafc;cursor:pointer;">
+      <button id="btnNew" style="flex:1;padding:16px;border-radius:10px;border:1px solid var(--border);background:var(--bg-light);cursor:pointer;">
         <i class="fa-solid fa-user-plus"></i><br>New Customer
       </button>
     </div>`;
@@ -1129,10 +1249,10 @@ function renderCustomerTypeStep() {
 function renderExistingCustomerStep() {
   wizardTitle('New Order — Select Customer');
   wizardBody().innerHTML = `
-    <input id="custSearch" placeholder="Search company, GST or contact person" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:10px;">
+    <input id="custSearch" placeholder="Search company, GST or contact person" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px;">
     <div id="custResults" style="max-height:280px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;"></div>
     <div style="display:flex;justify-content:flex-start;margin-top:14px;">
-      <button type="button" id="backBtn1" style="padding:10px 16px;border-radius:8px;border:none;background:#e5e7eb;cursor:pointer;">Back</button>
+      <button type="button" id="backBtn1" style="padding:10px 16px;border-radius:8px;border:none;background:var(--border);cursor:pointer;">Back</button>
     </div>`;
   document.getElementById('backBtn1').addEventListener('click', renderCustomerTypeStep);
 
@@ -1140,18 +1260,18 @@ function renderExistingCustomerStep() {
   const resultsBox = document.getElementById('custResults');
 
   const runSearch = async () => {
-    resultsBox.innerHTML = '<small style="color:#94a3b8;">Searching...</small>';
+    resultsBox.innerHTML = '<small style="color:var(--text-light);">Searching...</small>';
     try {
       const term = searchInput.value.trim();
       const res = await apiFetch(`/customer/search?term=${encodeURIComponent(term)}`);
       const data = await res.json();
       const list = data.dataset || [];
-      if (!list.length) { resultsBox.innerHTML = '<small style="color:#94a3b8;">No customers found.</small>'; return; }
+      if (!list.length) { resultsBox.innerHTML = '<small style="color:var(--text-light);">No customers found.</small>'; return; }
       resultsBox.innerHTML = list.map(c => `
-        <div class="cust-row" data-id="${c.customer_id}" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <div class="cust-row" data-id="${c.customer_id}" style="border:1px solid var(--border);border-radius:8px;padding:10px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px;">
           <div>
             <strong>${c.company_name ?? ''}</strong><br>
-            <small style="color:#64748b;">${c.gst_number ?? ''} • ${c.contractor_person ?? ''} • ${c.contractor_number ?? ''}</small>
+            <small style="color:var(--text-muted);">${c.gst_number ?? ''} • ${c.contractor_person ?? ''} • ${c.contractor_number ?? ''}</small>
           </div>
           <div style="display:flex;gap:6px;flex-shrink:0;">
             <button type="button" class="cust-edit icon-btn" data-id="${c.customer_id}" title="Edit"><i class="fa-solid fa-pen"></i></button>
@@ -1182,7 +1302,7 @@ function renderExistingCustomerStep() {
         }
       }));
     } catch (err) {
-      if (err.message !== 'unauthorized' && err.message !== 'forbidden') resultsBox.innerHTML = '<small style="color:#d62828;">Search failed.</small>';
+      if (err.message !== 'unauthorized' && err.message !== 'forbidden') resultsBox.innerHTML = '<small style="color:var(--danger);">Search failed.</small>';
     }
   };
 
@@ -1203,8 +1323,8 @@ function renderEditCustomerForm(c) {
       <input name="contractor_number" placeholder="Contractor Number" value="${c.contractor_number ?? ''}" required>
       <input name="contractor_email" type="email" placeholder="Contractor Email" value="${c.contractor_email ?? ''}" required>
       <div style="display:flex;justify-content:space-between;margin-top:10px;">
-        <button type="button" id="cancelEditCust" style="padding:10px 16px;border-radius:8px;border:none;background:#e5e7eb;cursor:pointer;">Cancel</button>
-        <button type="submit" style="padding:10px 16px;border-radius:8px;border:none;background:#2563eb;color:#fff;cursor:pointer;">Save</button>
+        <button type="button" id="cancelEditCust" style="padding:10px 16px;border-radius:8px;border:none;background:var(--border);cursor:pointer;">Cancel</button>
+        <button type="submit" style="padding:10px 16px;border-radius:8px;border:none;background:var(--primary);color:#fff;cursor:pointer;">Save</button>
       </div>
     </form>`;
   document.getElementById('cancelEditCust').addEventListener('click', renderExistingCustomerStep);
@@ -1248,8 +1368,8 @@ function renderNewCustomerStep() {
       <div style = padding-left:5px;><small><p>Credit Limit</p></small></div>
       <input name="credit_limit" type="number" min="0" step="0.01" placeholder="Credit Limit (₹)" value="0">
       <div style="display:flex;justify-content:space-between;margin-top:10px;">
-        <button type="button" id="backBtn2" style="padding:10px 16px;border-radius:8px;border:none;background:#e5e7eb;cursor:pointer;">Back</button>
-        <button type="submit" style="padding:10px 16px;border-radius:8px;border:none;background:#2563eb;color:#fff;cursor:pointer;">Next</button>
+        <button type="button" id="backBtn2" style="padding:10px 16px;border-radius:8px;border:none;background:var(--border);cursor:pointer;">Back</button>
+        <button type="submit" style="padding:10px 16px;border-radius:8px;border:none;background:var(--primary);color:#fff;cursor:pointer;">Next</button>
       </div>
     </form>`;
   document.getElementById('backBtn2').addEventListener('click', renderCustomerTypeStep);
@@ -1308,8 +1428,10 @@ function renderProductsStep() {
   const stockFor = (p) => totalQtyByKey.get(rowKey(p)) ?? (Number(p.quantity) || 0);
 
   wizardBody().innerHTML = `
-    <div id="prodCatTabs" style="display:flex;gap:8px;margin-bottom:10px;"></div>
-    <input id="prodFilter" placeholder="Filter products..." style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:10px;">
+    <div id="serialSearchBox" style="margin-bottom:6px;"></div>
+    <div id="serialAddedMsg" style="font-size:12px;color:var(--success-dark);margin-bottom:8px;"></div>
+    <div id="prodCatTabs" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px;"></div>
+    <input id="prodFilter" placeholder="Filter products..." style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px;">
     <div style="margin-top:14px;">
       <table style="width:100%;font-size:13px;border-collapse:collapse;">
         <thead><tr style="text-align:left;color:#fff;">
@@ -1319,8 +1441,8 @@ function renderProductsStep() {
       </table>
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;">
-      <button type="button" id="backBtn3" style="padding:10px 16px;border-radius:8px;border:none;background:#e5e7eb;cursor:pointer;">Back</button>
-      <button type="button" id="toPaymentBtn" style="padding:10px 16px;border-radius:8px;border:none;background:#2563eb;color:#fff;cursor:pointer;">Create Order</button>
+      <button type="button" id="backBtn3" style="padding:10px 16px;border-radius:8px;border:none;background:var(--border);cursor:pointer;">Back</button>
+      <button type="button" id="toPaymentBtn" style="padding:10px 16px;border-radius:8px;border:none;background:var(--primary);color:#fff;cursor:pointer;">Create Order</button>
     </div>`;
 
   document.getElementById('backBtn3').addEventListener('click', () => wiz.customerId ? renderExistingCustomerStep() : renderNewCustomerStep());
@@ -1332,14 +1454,15 @@ function renderProductsStep() {
   const categories = [
     { type: 'product', label: 'Products' },
     { type: 'accessories', label: 'Accessories' },
-    { type: 'spare_parts', label: 'Spare Parts' }
+    { type: 'spare_parts', label: 'Spare Parts' },
+    { type: 'service_parts', label: 'Service Parts' }
   ];
   let activeCategory = 'product';
 
   function paintCatTab(btn, active) {
-    btn.style.border = active ? '1px solid #1665ff' : '1px solid #e2e8f0';
-    btn.style.background = active ? '#eaf1ff' : '#f8fafc';
-    btn.style.color = active ? '#1665ff' : '#334155';
+    btn.style.border = active ? '1px solid var(--primary)' : '1px solid var(--border)';
+    btn.style.background = active ? 'var(--info-bg)' : 'var(--bg-light)';
+    btn.style.color = active ? 'var(--primary)' : 'var(--text-secondary)';
     btn.style.borderRadius = '8px';
     btn.style.padding = '8px 14px';
     btn.style.cursor = 'pointer';
@@ -1386,12 +1509,12 @@ function renderProductsStep() {
     const qtyInCart = wiz.cart[key]?.quantity ?? '';
     return `
       <tr>
-        <td>${p.product_name ?? ''}<br><small style="color:#94a3b8;">${p.product_id}${p.model_no ? ' · ' + p.model_no : ''}</small></td>
+        <td>${p.product_name ?? ''}<br><small style=\"color:var(--text-light);\">${(p.product_type === 'spare_parts' || p.product_type === 'service_parts') ? 'Belongs to: ' + (p.parent_product_name || '—') : p.product_id + (p.model_no ? ' · ' + p.model_no : '')}</small></td>
         <td>${stockFor(p)}</td>
         <td>₹${p.price ?? 0}</td>
         <td><input type="number" min="0" inputmode="numeric" value="${qtyInCart}"
               placeholder="0" data-row-key="${key}" class="qtyInput"
-              style="width:60px;padding:6px;border:1px solid #e2e8f0;border-radius:6px;"></td>
+              style="width:60px;padding:6px;border:1px solid var(--border);border-radius:6px;"></td>
       </tr>`;
   }
 
@@ -1487,15 +1610,15 @@ function renderProductsStep() {
     const term = document.getElementById('prodFilter').value.trim().toLowerCase();
     const base = currentCategoryProducts();
     const filtered = term
-      ? base.filter(p => (p.product_name || '').toLowerCase().includes(term) || (p.product_id || '').toLowerCase().includes(term) || (p.model_no || '').toLowerCase().includes(term))
+      ? base.filter(p => (p.product_name || '').toLowerCase().includes(term) || (p.product_id || '').toLowerCase().includes(term) || (p.model_no || '').toLowerCase().includes(term) || (p.parent_product_name || '').toLowerCase().includes(term))
       : base;
     renderRows(filtered);
   }
 
   applyFilters();
   if (!products.length) {
-    rowsBox.innerHTML = `<tr><td colspan="4" style="text-align:center;padding:16px;color:#94a3b8;">
-      No products loaded. <button type="button" id="retryInvBtn" style="border:none;background:#eef2ff;color:#2563eb;padding:4px 10px;border-radius:6px;cursor:pointer;">Retry</button>
+    rowsBox.innerHTML = `<tr><td colspan="4" style="text-align:center;padding:16px;color:var(--text-light);">
+      No products loaded. <button type="button" id="retryInvBtn" style="border:none;background:var(--info-bg);color:var(--primary);padding:4px 10px;border-radius:6px;cursor:pointer;">Retry</button>
     </td></tr>`;
     document.getElementById('retryInvBtn')?.addEventListener('click', async () => {
       await loadInventoryForOrders();
@@ -1504,6 +1627,26 @@ function renderProductsStep() {
   }
 
   document.getElementById('prodFilter').addEventListener('input', applyFilters);
+
+  const addedMsg = document.getElementById('serialAddedMsg');
+  window.serialSearchWidget(document.getElementById('serialSearchBox'), (r) => {
+    const key = `${r.product_id}||${r.product_name || ''}||${r.model_no || ''}`;
+    const choices = wiz.serialChoices[key] || (wiz.serialChoices[key] = []);
+    if (wiz.cart[key] && choices.includes(r.serial_number)) { addedMsg.textContent = r.serial_number + ' is already added.'; return; }
+    const prev = wiz.cart[key]?.quantity || 0;
+    choices.forEach((c, i) => { if (c === r.serial_number) choices[i] = ''; });
+    choices[prev] = r.serial_number;
+    wiz.cart[key] = {
+      product_id: r.product_id,
+      product_name: r.product_name,
+      model_no: r.model_no || '',
+      price: wiz.cart[key] ? wiz.cart[key].price : (Number(r.price) || 0),
+      tax_rate: wiz.cart[key] ? wiz.cart[key].tax_rate : (Number(r.tax_rate) || 0),
+      quantity: prev + 1
+    };
+    addedMsg.textContent = `Added ${r.serial_number} - ${r.product_name} (qty ${prev + 1})`;
+    applyFilters();
+  });
 
   document.getElementById('toPaymentBtn').addEventListener('click', () => {
     if (!Object.keys(wiz.cart).length) { alert('Add quantity for at least one item — a product, accessory or spare part.'); return; }
@@ -1520,54 +1663,64 @@ function renderPaymentStep() {
   if (wiz.warrantyCharge === undefined) wiz.warrantyCharge = 0;
 
   wizardBody().innerHTML = `
-    <div style="background:#f8fafc;border-radius:8px;padding:10px;margin-bottom:12px;font-size:13px;">
+    <div style="background:var(--bg-light);border-radius:8px;padding:10px;margin-bottom:12px;font-size:13px;">
       ${cartItems.map((i, idx) => `
-        <div style="padding:6px 0;border-bottom:1px solid #e2e8f0;">
+        <div style="padding:6px 0;border-bottom:1px solid var(--border);">
           <div style="font-weight:600;">${i.product_name} × ${i.quantity}</div>
           <div style="display:flex;gap:8px;margin-top:4px;">
-            <label style="flex:1;font-size:11px;color:#64748b;">Price / pc (₹)
-              <input type="number" min="0" step="any" class="wizPrice" data-idx="${idx}" value="${i.price}" style="width:100%;padding:6px;border:1px solid #e2e8f0;border-radius:6px;">
+            <label style="flex:1;font-size:11px;color:var(--text-muted);">Price / pc (₹)
+              <input type="number" min="0" step="any" class="wizPrice" data-idx="${idx}" value="${i.price}" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;">
             </label>
-            <label style="flex:1;font-size:11px;color:#64748b;">Tax % / pc
-              <input type="number" min="0" step="any" class="wizTax" data-idx="${idx}" value="${i.tax_rate}" style="width:100%;padding:6px;border:1px solid #e2e8f0;border-radius:6px;">
+            <label style="flex:1;font-size:11px;color:var(--text-muted);">Tax % / pc
+              <input type="number" min="0" step="any" class="wizTax" data-idx="${idx}" value="${i.tax_rate}" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;">
             </label>
-            <div style="flex:1;font-size:11px;color:#64748b;">Line (excl. tax)
-              <div class="wizLine" data-idx="${idx}" style="padding:6px 0;font-size:13px;color:#0f172a;">₹${(i.price * i.quantity).toFixed(2)}</div>
+            <div style="flex:1;font-size:11px;color:var(--text-muted);">Line (excl. tax)
+              <div class="wizLine" data-idx="${idx}" style="padding:6px 0;font-size:13px;color:var(--text-primary);">₹${(i.price * i.quantity).toFixed(2)}</div>
             </div>
           </div>
         </div>`).join('')}
       <div id="wizSubtotal" style="margin-top:8px;">Subtotal: ₹${subtotal.toFixed(2)}</div>
     </div>
-    <div style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-bottom:12px;">
-      <label style="font-size:13px;font-weight:600;color:#334155;">Warranty</label>
+    <div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px;">
+      <label style="font-size:13px;font-weight:600;color:var(--text-secondary);">Warranty</label>
       <div style="display:flex;gap:14px;margin:8px 0;font-size:13px;">
         <label><input type="radio" name="warrantyChoice" value="standard" ${wiz.warrantyYears <= 1 ? 'checked' : ''}> Standard (1 Year)</label>
         <label><input type="radio" name="warrantyChoice" value="extend" ${wiz.warrantyYears > 1 ? 'checked' : ''}> Extend Warranty</label>
       </div>
       <div id="extendWarrantyBox" style="display:${wiz.warrantyYears > 1 ? 'flex' : 'none'};gap:10px;">
-        <select id="warrantyYearsSelect" style="flex:1;padding:8px;border:1px solid #e2e8f0;border-radius:8px;">
+        <select id="warrantyYearsSelect" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:8px;">
           <option value="2" ${wiz.warrantyYears === 2 ? 'selected' : ''}>2 Years</option>
           <option value="3" ${wiz.warrantyYears === 3 ? 'selected' : ''}>3 Years</option>
           <option value="4" ${wiz.warrantyYears === 4 ? 'selected' : ''}>4 Years</option>
           <option value="5" ${wiz.warrantyYears === 5 ? 'selected' : ''}>5 Years</option>
         </select>
-        <input id="warrantyChargeInput" type="number" min="0" placeholder="Additional Charge (₹)" value="${wiz.warrantyCharge || ''}" style="flex:1;padding:8px;border:1px solid #e2e8f0;border-radius:8px;">
+        <input id="warrantyChargeInput" type="number" min="0" placeholder="Additional Charge (₹)" value="${wiz.warrantyCharge || ''}" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:8px;">
       </div>
     </div>
-    <select id="paymentMode" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:10px;">
+    <select id="paymentMode" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px;">
       <option value="">Select Payment Mode</option>
       ${PAYMENT_MODES.map(m => `<option value="${m.value}">${m.label}</option>`).join('')}
     </select>
     <div id="paymentExtra"></div>
+    <label style="font-size:13px;color:var(--text-muted);">Reference <span style="color:var(--danger,#d62828);">*</span></label>
+    <select id="orderReference" required style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:4px 0 10px;">
+      <option value="">Select reference</option>
+    </select>
     <div style = "padding-left:8px" ><small><p>Discount<p><small></div>
-    <input id="discountInput" type="number" min="0" placeholder="Discount (₹)" value="0" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:10px 0;">
-    <div id="grandTotalBox" style="font-size:13px;color:#334155;margin-bottom:10px;"></div>
+    <input id="discountInput" type="number" min="0" placeholder="Discount (₹)" value="0" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:10px 0;">
+    <div id="grandTotalBox" style="font-size:13px;color:var(--text-secondary);margin-bottom:10px;"></div>
     <div style="display:flex;justify-content:space-between;margin-top:10px;">
-      <button type="button" id="backBtn4" style="padding:10px 16px;border-radius:8px;border:none;background:#e5e7eb;cursor:pointer;">Back</button>
-      <button type="button" id="placeOrderBtn" style="padding:10px 16px;border-radius:8px;border:none;background:#16a34a;color:#fff;cursor:pointer;">Place Order</button>
+      <button type="button" id="backBtn4" style="padding:10px 16px;border-radius:8px;border:none;background:var(--border);cursor:pointer;">Back</button>
+      <button type="button" id="placeOrderBtn" style="padding:10px 16px;border-radius:8px;border:none;background:var(--success-dark);color:#fff;cursor:pointer;">Place Order</button>
     </div>`;
 
   document.getElementById('backBtn4').addEventListener('click', renderProductsStep);
+  loadReferenceUsers().then(list => {
+    const sel = document.getElementById('orderReference');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">Select reference</option>' + list.map(u =>
+      `<option value="${u.username}" ${u.username === wiz.reference ? 'selected' : ''}>${u.name || u.username} (${u.username}${u.role === 'distributor' ? ' · Sales' : (u.role ? ' · ' + u.role.replace('_', ' ') : '')})</option>`).join('');
+  });
 
   const modeSelect = document.getElementById('paymentMode');
   const extraBox = document.getElementById('paymentExtra');
@@ -1584,6 +1737,9 @@ function renderPaymentStep() {
     if (subEl) subEl.textContent = `Subtotal: ₹${subtotal.toFixed(2)}`;
     const total = subtotal - (wiz.discount || 0) + (wiz.warrantyCharge || 0);
     document.getElementById('grandTotalBox').textContent = `Grand Total (excl. tax): ₹${total.toFixed(2)}`;
+    // keep the Partial payment hint (balance) in step with discount / price / warranty changes
+    const partialPaid = document.getElementById('partialPaid');
+    if (partialPaid) partialPaid.dispatchEvent(new Event('input'));
   }
 
   document.querySelectorAll('.wizPrice').forEach(inp => inp.addEventListener('input', () => {
@@ -1617,12 +1773,25 @@ function renderPaymentStep() {
   document.getElementById('placeOrderBtn').addEventListener('click', () => proceedToSerialReview(modeSelect, extraBox));
 }
 
+let referenceUsersCache = null;
+async function loadReferenceUsers() {
+  if (referenceUsersCache) return referenceUsersCache;
+  try {
+    const res = await apiFetch('/account/users');
+    if (res.ok) referenceUsersCache = (await res.json()).dataset || [];
+  } catch (e) { /* leave empty */ }
+  return referenceUsersCache || [];
+}
+
 // Validates payment step inputs (same checks submitOrder used to do up front),
 // stashes them on wiz, then moves to the serial-number review step instead of
 // submitting immediately.
 function proceedToSerialReview(modeSelect, extraBox) {
   const mode = modeSelect.value;
   if (!mode) { alert('Please select a payment mode.'); return; }
+
+  const referenceValue = document.getElementById('orderReference')?.value || '';
+  if (!referenceValue) { alert('Reference is required. Please select a reference user.'); return; }
 
   if (wiz.warrantyYears > 1 && (!wiz.warrantyCharge || wiz.warrantyCharge <= 0)) {
     alert('Please enter the additional charge for the extended warranty.');
@@ -1639,6 +1808,7 @@ function proceedToSerialReview(modeSelect, extraBox) {
 
   wiz.paymentMode = mode;
   wiz.paymentDetails = payment_details;
+  wiz.reference = referenceValue;
   renderSerialReviewStep();
 }
 
@@ -1647,7 +1817,7 @@ function proceedToSerialReview(modeSelect, extraBox) {
 async function renderSerialReviewStep() {
   wizardTitle('New Order — Review Serial Numbers');
   const body = wizardBody();
-  body.innerHTML = `<p style="color:#94a3b8;">Loading available serial numbers...</p>`;
+  body.innerHTML = `<p style="color:var(--text-light);">Loading available serial numbers...</p>`;
 
   const cartItems = Object.values(wiz.cart);
   const rowKeyOf = (i) => `${i.product_id}||${i.product_name}||${i.model_no || ''}`;
@@ -1667,7 +1837,7 @@ async function renderSerialReviewStep() {
     }
   }));
 
-  let html = `<p style="color:#64748b;margin-bottom:12px;font-size:13px;">
+  let html = `<p style="color:var(--text-muted);margin-bottom:12px;font-size:13px;">
     Each unit is auto-assigned the oldest available serial number. Pick a different one below if needed — search by typing in the box.
   </p>`;
 
@@ -1678,27 +1848,30 @@ async function renderSerialReviewStep() {
     const needed = item.quantity;
     const slots = Math.min(needed, available.length);
 
-    html += `<div style="margin-bottom:16px;border:1px solid #e2e8f0;border-radius:8px;padding:10px;">
+    html += `<div style="margin-bottom:16px;border:1px solid var(--border);border-radius:8px;padding:10px;">
       <strong>${item.product_name}${item.model_no ? ' · ' + item.model_no : ''}</strong> × ${needed}`;
 
     if (!available.length) {
-      html += `<p style="font-size:12px;color:#94a3b8;margin-top:4px;">No serial numbers on file for this item — will ship unserialized.</p></div>`;
+      html += `<p style="font-size:12px;color:var(--text-light);margin-top:4px;">No serial numbers on file for this item — will ship unserialized.</p></div>`;
       return;
     }
     if (needed > available.length) {
-      html += `<p style="font-size:12px;color:#d62828;margin-top:4px;">Only ${available.length} serial number(s) on file — the remaining ${needed - available.length} unit(s) will ship unserialized.</p>`;
+      html += `<p style="font-size:12px;color:var(--danger);margin-top:4px;">Only ${available.length} serial number(s) on file — the remaining ${needed - available.length} unit(s) will ship unserialized.</p>`;
     }
 
     const existingChoices = wiz.serialChoices[rowKey] || [];
+    const usedSerials = new Set(existingChoices.filter(Boolean));
+    const serialPool = available.filter(sn => !usedSerials.has(sn));
+    let poolIdx = 0;
     for (let slot = 0; slot < slots; slot++) {
-      const defaultSerial = available[slot]; // same order the backend auto-allocates in
-      const chosen = existingChoices[slot] || defaultSerial;
+      const pinnedSerial = existingChoices[slot];
+      const chosen = pinnedSerial || serialPool[poolIdx++] || '';
       html += `
         <div style="margin-top:8px;">
-          <label style="font-size:12px;color:#64748b;">Unit ${slot + 1} serial number${chosen === defaultSerial ? ' (auto)' : ''}</label>
+          <label style="font-size:12px;color:var(--text-muted);">Unit ${slot + 1} serial number${pinnedSerial ? '' : ' (auto)'}</label>
           <input list="serialList__${rowKey.replace(/[^a-zA-Z0-9]/g, '_')}__${slot}" class="serialPickInput"
                  data-row-key="${rowKey}" data-slot="${slot}" value="${chosen}"
-                 style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:8px;">
+                 style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;">
           <datalist id="serialList__${rowKey.replace(/[^a-zA-Z0-9]/g, '_')}__${slot}">
             ${available.map(sn => `<option value="${sn}">`).join('')}
           </datalist>
@@ -1709,8 +1882,8 @@ async function renderSerialReviewStep() {
 
   html += `
     <div style="display:flex;justify-content:space-between;margin-top:14px;">
-      <button type="button" id="backBtn5" style="padding:10px 16px;border-radius:8px;border:none;background:#e5e7eb;cursor:pointer;">Back</button>
-      <button type="button" id="confirmSerialsBtn" style="padding:10px 16px;border-radius:8px;border:none;background:#16a34a;color:#fff;cursor:pointer;">Confirm &amp; Place Order</button>
+      <button type="button" id="backBtn5" style="padding:10px 16px;border-radius:8px;border:none;background:var(--border);cursor:pointer;">Back</button>
+      <button type="button" id="confirmSerialsBtn" style="padding:10px 16px;border-radius:8px;border:none;background:var(--success-dark);color:#fff;cursor:pointer;">Confirm &amp; Place Order</button>
     </div>`;
 
   body.innerHTML = html;
@@ -1751,6 +1924,7 @@ async function renderSerialReviewStep() {
 }
 
 async function finalizeSubmitOrder() {
+  if (!wiz.reference) { alert('Reference is required. Please go back and select a reference user.'); return; }
   const payload = {
     customer_id: wiz.customerId || '',
     customer: wiz.customer || {},
@@ -1768,6 +1942,7 @@ async function finalizeSubmitOrder() {
     }),
     payment_mode: wiz.paymentMode,
     payment_details: wiz.paymentDetails,
+    reference: wiz.reference || '',
     discount: wiz.discount || 0,
     warranty_years: wiz.warrantyYears || 1,
     warranty_charge: wiz.warrantyYears > 1 ? (wiz.warrantyCharge || 0) : 0
@@ -1793,42 +1968,79 @@ async function finalizeSubmitOrder() {
 function renderPaymentExtra(mode, extraBox) {
   if (mode === 'Credit') {
     extraBox.innerHTML = `
-      <label style="font-size:13px;color:#64748b;">Credit Period</label>
-      <select id="creditDaysSelect" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">
+      <label style="font-size:13px;color:var(--text-muted);">Credit Period</label>
+      <select id="creditDaysSelect" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
         <option value="15">15 days</option>
         <option value="30">30 days</option>
         <option value="45">45 days</option>
         <option value="60">60 days</option>
         <option value="manual">Other (enter days)</option>
       </select>
-      <input id="creditDaysManual" type="number" min="1" max="60" placeholder="Enter days (max 60)" style="display:none;width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;">`;
+      <input id="creditDaysManual" type="number" min="1" max="60" placeholder="Enter days (max 60)" style="display:none;width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">`;
     const sel = document.getElementById('creditDaysSelect');
     const manual = document.getElementById('creditDaysManual');
     sel.addEventListener('change', () => manual.style.display = sel.value === 'manual' ? 'block' : 'none');
+  } else if (mode === 'Partial') {
+    // part of the amount is paid now, the remaining balance is due after the chosen number of days
+    extraBox.innerHTML = `
+      <label style="font-size:13px;color:var(--text-muted);">Amount paid now (₹)</label>
+      <input id="partialPaid" type="number" min="0" step="any" placeholder="e.g. half of the total" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
+      <label style="font-size:13px;color:var(--text-muted);">In how many days will the remaining payment be made?</label>
+      <select id="partialDaysSelect" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
+        <option value="15">15 days</option>
+        <option value="30">30 days</option>
+        <option value="45">45 days</option>
+        <option value="60">60 days</option>
+        <option value="manual">Other (enter days)</option>
+      </select>
+      <input id="partialDaysManual" type="number" min="1" max="60" placeholder="Enter days (max 60)" style="display:none;width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">
+      <div id="partialHint" style="font-size:12px;color:var(--warning-dark);background:var(--warning-bg);border-radius:8px;padding:8px 10px;margin-top:6px;"></div>`;
+    const sel = document.getElementById('partialDaysSelect');
+    const manual = document.getElementById('partialDaysManual');
+    const paid = document.getElementById('partialPaid');
+    const hint = document.getElementById('partialHint');
+    const refreshHint = () => {
+      const total = wizOrderTotal();
+      const p = Number(paid.value) || 0;
+      const fmt = n => '₹' + n.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+      hint.textContent = `Order total (incl. tax): ${fmt(total)} — paid now ${fmt(p)}, balance ${fmt(Math.max(total - p, 0))} on credit.`;
+    };
+    sel.addEventListener('change', () => manual.style.display = sel.value === 'manual' ? 'block' : 'none');
+    paid.addEventListener('input', refreshHint);
+    refreshHint();
   } else if (mode === 'Cheque') {
     extraBox.innerHTML = `
-      <input id="chequeNumber" placeholder="Cheque Number" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">
-      <input id="chequeDate" type="date" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">
-      <input id="chequeBank" placeholder="Bank Name" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;">`;
+      <input id="chequeNumber" placeholder="Cheque Number" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
+      <input id="chequeDate" type="date" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
+      <input id="chequeBank" placeholder="Bank Name" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">`;
   } else if (mode === 'DemandDraft') {
     extraBox.innerHTML = `
-      <input id="ddNumber" placeholder="Demand Draft Number" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">
-      <input id="ddDate" type="date" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">
-      <input id="ddBank" placeholder="Bank Name" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;">`;
+      <input id="ddNumber" placeholder="Demand Draft Number" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
+      <input id="ddDate" type="date" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
+      <input id="ddBank" placeholder="Bank Name" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">`;
   } else if (mode === 'UPI') {
     extraBox.innerHTML = `
-      <input id="upiId" placeholder="UPI ID (e.g. name@bank)" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">`;
+      <input id="upiId" placeholder="UPI ID (e.g. name@bank)" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">`;
   } else if (mode === 'NetBanking') {
     extraBox.innerHTML = `
-      <input id="nbBank" placeholder="Bank Name" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">
-      <input id="nbAccount" placeholder="Account Number" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">
-      <input id="nbIfsc" placeholder="IFSC Code" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;">`;
+      <input id="nbBank" placeholder="Bank Name" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
+      <input id="nbAccount" placeholder="Account Number" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">
+      <input id="nbIfsc" placeholder="IFSC Code" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">`;
   } else if (mode === 'Cash') {
     extraBox.innerHTML = `
-      <input id="cashReceivedBy" placeholder="Received By (Person Name)" style="width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin:6px 0;">`;
+      <input id="cashReceivedBy" placeholder="Received By (Person Name)" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;margin:6px 0;">`;
   } else {
     extraBox.innerHTML = '';
   }
+}
+
+// order total as the backend works it out: price x qty + tax per line, minus discount, plus extended-warranty charge
+function wizOrderTotal() {
+  const lines = Object.values(wiz.cart).reduce((s, i) => {
+    const line = (Number(i.price) || 0) * (Number(i.quantity) || 0);
+    return s + line + line * (Number(i.tax_rate) || 0) / 100;
+  }, 0);
+  return Math.round((lines - (Number(wiz.discount) || 0) + (Number(wiz.warrantyCharge) || 0)) * 100) / 100;
 }
 
 function buildPaymentDetails(mode) {
@@ -1838,6 +2050,17 @@ function buildPaymentDetails(mode) {
     const days = sel.value === 'manual' ? Number(manual.value) : Number(sel.value);
     if (!days || days < 1 || days > 60) throw new Error('Credit days must be between 1 and 60.');
     return { credit_days: days };
+  }
+  if (mode === 'Partial') {
+    const paid = Number(document.getElementById('partialPaid').value) || 0;
+    const sel = document.getElementById('partialDaysSelect');
+    const manual = document.getElementById('partialDaysManual');
+    const days = sel.value === 'manual' ? Number(manual.value) : Number(sel.value);
+    const total = wizOrderTotal();
+    if (paid <= 0) throw new Error('Enter the amount paid now for a partial payment.');
+    if (total > 0 && paid >= total) throw new Error('Partial payment must be less than the order total — choose another payment mode.');
+    if (!days || days < 1 || days > 60) throw new Error('Days for the remaining payment must be between 1 and 60.');
+    return { paid_amount: paid, credit_days: days };
   }
   if (mode === 'Cheque') {
     const cheque_number = document.getElementById('chequeNumber').value.trim();
@@ -1910,11 +2133,11 @@ function renderOrderRequests(requests) {
           </div>
         </div>
         <div style="display:flex;gap:8px;">
-          <button class="icon-btn oreq-approve" data-id="${r.request_id}" title="Approve"><i class="fa-solid fa-check" style="color:#16a34a;"></i></button>
-          <button class="icon-btn oreq-reject" data-id="${r.request_id}" title="Reject"><i class="fa-solid fa-xmark" style="color:#d62828;"></i></button>
+          <button class="icon-btn oreq-approve" data-id="${r.request_id}" title="Approve"><i class="fa-solid fa-check" style="color:var(--success-dark);"></i></button>
+          <button class="icon-btn oreq-reject" data-id="${r.request_id}" title="Reject"><i class="fa-solid fa-xmark" style="color:var(--danger);"></i></button>
         </div>
       </div>`;
-  }).join('') : '<p style="color:#94a3b8;padding:10px;">No pending order requests.</p>';
+  }).join('') : '<p style="color:var(--text-light);padding:10px;">No pending order requests.</p>';
 
   box.querySelectorAll('.oreq-approve').forEach(btn => btn.addEventListener('click', () => approveOrderRequest(btn.dataset.id)));
   box.querySelectorAll('.oreq-reject').forEach(btn => btn.addEventListener('click', () => rejectOrderRequest(btn.dataset.id)));

@@ -1,3 +1,9 @@
+/* ---- A4 print support: print_a4.js is loaded on demand (safe if it is missing) ---- */
+(function () { if (typeof A4Print === 'undefined' && !document.getElementById('a4printjs')) { const s = document.createElement('script'); s.id = 'a4printjs'; s.src = 'print_a4.js'; document.head.appendChild(s); } })();
+function a4Ready(cb, n) { n = n || 0; if (typeof A4Print !== 'undefined') return cb(); if (n < 50) setTimeout(() => a4Ready(cb, n + 1), 200); }
+function a4Intercept(head, rows, name) { return typeof A4Print !== 'undefined' && A4Print.intercept(head, rows, name); }
+function a4WizardPrint(modal, title) { if (typeof A4Print !== 'undefined') A4Print.wizardPrint(modal, title); }
+function a4Twin(btn, title) { if (btn) a4Ready(() => A4Print.attachTwin(btn, title)); }
 // =========================================================
 // assembly.js
 // Powers pages/assembly.html — cards, table/filtering, and the
@@ -47,12 +53,13 @@ function fromServerShapeAssembly(a) {
     productId: a.product_id,
     modelNumber: a.model_number,
     quantity: a.quantity,
-    partsUsed: (a.parts_used || []).map(p => ({ name: p.part_name, quantity: p.quantity, source: p.source })),
-    serials: (a.serials || []).map(s => ({ serial: s.serial_number, hologram: s.hologram_number })),
+    partsUsed: (a.parts_used || []).map(p => ({ name: p.part_name, quantity: p.quantity, source: p.source, belongsTo: partBelongs(p) })),
+    serials: (a.serials || []).map(s => ({ serial: s.serial_number, hologram: s.hologram_number, lot: s.lot_no || '' })),
     status: a.status,
     approvedSerials: a.approved_serials || [],
     createdAt: a.created_at,
     hologramPart: a.hologram_part || '',
+    hologramPartBelongs: a.hologram_part_belongs_to || '',
     editHistory: a.edit_history || [],
   };
 }
@@ -64,9 +71,9 @@ function toServerShapeAssembly(a) {
     model_number: a.modelNumber || '',
     quantity: Number(a.quantity) || 0,
     parts_used: (a.partsUsed || []).map(p => ({
-      part_name: p.name, quantity: Number(p.quantity) || 0, source: p.source,
+      part_name: p.name, quantity: Number(p.quantity) || 0, source: p.source, belongs_to: p.belongsTo || '',
     })),
-    serials: (a.serials || []).map(s => ({ serial_number: s })),
+    serials: (a.serials || []).map((s, i) => ({ serial_number: s, lot_no: String((a.lots || [])[i] || '').trim() })),
   };
 }
 
@@ -102,20 +109,260 @@ async function loadAvailableParts() {
   if (el) el.textContent = availableParts.length;
 }
 
-function renderCards() {
+function assemblyCardList(type) {
   const now = new Date();
-  const thisMonth = assemblies.filter(a => {
+  if (type === 'month') return assemblies.filter(a => {
     const d = new Date(a.createdAt);
     return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-  }).length;
-  const today = assemblies.filter(a => (a.createdAt || '').slice(0, 10) === todayStr()).length;
-  const pending = assemblies.filter(a => a.status === 'pending').length;
+  });
+  if (type === 'today') return assemblies.filter(a => (a.createdAt || '').slice(0, 10) === todayStr());
+  if (type === 'pending') return assemblies.filter(a => a.status === 'pending');
+  if (type === 'awaiting') return assemblies.filter(a => isApprovalStatus(a.status));
+  return [];
+}
 
-  document.getElementById('cardThisMonth').textContent = thisMonth;
-  document.getElementById('cardToday').textContent = today;
-  document.getElementById('cardPending').textContent = pending;
+function renderCards() {
+  document.getElementById('cardThisMonth').textContent = assemblyCardList('month').length;
+  document.getElementById('cardToday').textContent = assemblyCardList('today').length;
+  document.getElementById('cardPending').textContent = assemblyCardList('pending').length;
+  document.getElementById('cardAwaiting').textContent = assemblyCardList('awaiting').length;
   document.getElementById('cardAvailableShipment').textContent = availableParts.length;
 }
+
+// =========================================================
+// CARD POPUPS — filters + export + click-through to full details
+// =========================================================
+const asmCV = { type: '', title: '', base: [], f: {} };
+
+const ASM_STATUS_LABEL = {
+  pending: 'Pending', pending_approval: 'Awaiting Approval',
+  partially_approved: 'Partially Approved', completed: 'Fully Approved',
+};
+
+function aesc(v) {
+  return String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function asmEnsureStyles() {
+  if (document.getElementById('asmCvStyles')) return;
+  const st = document.createElement('style');
+  st.id = 'asmCvStyles';
+  st.textContent = `
+    #viewAssemblyModal{z-index:1100 !important}
+    .as-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+    .as-head h3{margin:0}
+    .as-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+    .as-bar select,.as-bar input{padding:7px 9px;border:1px solid #e2e8f0;border-radius:8px;font-size:12.5px;background:#fff;color:#1e293b;min-width:0}
+    .as-bar input[type=text]{flex:1;min-width:150px}
+    .as-btn{padding:8px 12px;border:none;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600}
+    .as-btn.exp{background:#1665ff;color:#fff}
+    .as-btn.rst{background:#eef1f6;color:#334155}
+    .as-count{font-size:12px;color:#64748b;margin:0 0 8px}
+    .as-wrap{overflow:auto;max-height:58vh;border:1px solid #eef1f6;border-radius:10px}
+    .as-tbl{width:100%;font-size:12.5px;border-collapse:collapse;min-width:820px;color:#1e293b}
+    .as-tbl th{position:sticky;top:0;background:#f1f5f9 !important;color:#334155 !important;text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;white-space:nowrap}
+    .as-tbl td{padding:8px;border-bottom:1px solid #f1f5f9;vertical-align:top;color:#1e293b}
+    .as-tbl tbody tr.clk{cursor:pointer}
+    .as-tbl tbody tr.clk:hover{background:#f8fbff}
+    .as-sub{display:block;font-size:11px;color:#64748b;margin-top:1px}
+    .as-line{margin-bottom:6px}
+    .as-line:last-child{margin-bottom:0}
+    .as-chip{display:inline-block;font-size:10.5px;padding:1px 7px;border-radius:99px;background:#eef2ff;color:#3730a3;margin-left:4px}
+    .as-chip.local{background:#f1f5f9;color:#475569}
+    /* table headings were white-on-light-grey in the detail modals */
+    #viewAssemblyModal th,#assemblyModal th,#assemblyCardDetailModal th{color:#334155 !important}
+    #viewAssemblyModal thead,#assemblyModal thead{background:#f1f5f9 !important}
+  `;
+  document.head.appendChild(st);
+}
+
+function asmDate(d) { return (d || '').slice(0, 10) || '-'; }
+function asmSerialText(a) {
+  return (a.serials || []).map(s => s.hologram ? `${s.serial} (${s.hologram})` : s.serial).join(' | ');
+}
+function asmSource(a) {
+  const inv = (a.partsUsed || []).some(p => p.source !== 'local');
+  const loc = (a.partsUsed || []).some(p => p.source === 'local');
+  return inv && loc ? 'both' : inv ? 'inventory' : loc ? 'local' : 'none';
+}
+const ASM_SOURCE_LABEL = { both: 'Inventory + Local', inventory: 'Inventory', local: 'Local', none: '-' };
+
+function asmBase(type) {
+  const titles = {
+    month: 'Assemblies Built This Month', today: 'Assemblies Built Today',
+    parts: 'Hologram-tagged Parts', pending: 'Pending Assemblies', awaiting: 'Assemblies Awaiting Approval',
+  };
+  return [titles[type] || 'Assemblies', type === 'parts' ? availableParts.slice() : assemblyCardList(type)];
+}
+
+function asmFiltered() {
+  const f = asmCV.f;
+  const q = (f.q || '').toLowerCase();
+  if (asmCV.type === 'parts') {
+    return asmCV.base.filter(p => {
+      if (f.belongs && (partBelongs(p) || '') !== f.belongs) return false;
+      if (f.stock === 'tagged' && !(Number(p.hologram_available) > 0)) return false;
+      if (f.stock === 'none' && Number(p.hologram_available) > 0) return false;
+      if (q && !`${p.part_name} ${partBelongs(p)}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }
+  return asmCV.base.filter(a => {
+    if (f.status && a.status !== f.status) return false;
+    if (f.source && asmSource(a) !== f.source) return false;
+    if (f.product && a.productName !== f.product) return false;
+    if (f.from && (a.createdAt || '').slice(0, 10) < f.from) return false;
+    if (f.to && (a.createdAt || '').slice(0, 10) > f.to) return false;
+    if (q) {
+      const hay = [a.id, a.productName, a.productId, a.modelNumber,
+      ...(a.partsUsed || []).map(p => `${p.name} ${p.belongsTo || ''}`),
+      ...(a.serials || []).map(s => `${s.serial} ${s.hologram || ''}`)].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+function asmRowsHtml(list) {
+  if (asmCV.type === 'parts') {
+    if (!list.length) return '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:20px;">No parts match these filters.</td></tr>';
+    return list.map(p => `<tr>
+      <td><b>${aesc(p.part_name)}</b></td>
+      <td>${aesc(partBelongs(p) || '—')}</td>
+      <td>${aesc(p.hologram_available ?? 0)}</td>
+      <td>${aesc(p.quantity ?? 0)}</td></tr>`).join('');
+  }
+  if (!list.length) return '<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:20px;">No assemblies match these filters.</td></tr>';
+  return list.map(a => {
+    const parts = (a.partsUsed || []).map(p => `
+      <div class="as-line">${aesc(p.name)} × ${aesc(p.quantity)}<span class="as-chip ${p.source === 'local' ? 'local' : ''}">${p.source === 'local' ? 'Local' : 'Inventory'}</span>
+        ${p.belongsTo ? `<span class="as-sub">Belongs to: ${aesc(p.belongsTo)}</span>` : ''}</div>`).join('') || '<span style="color:#94a3b8;">—</span>';
+    return `<tr class="clk" data-id="${aesc(a.id)}">
+      <td><b>${aesc(a.productName)}</b><span class="as-sub">${aesc(a.modelNumber || '—')}</span></td>
+      <td>${aesc(a.quantity)}</td>
+      <td>${parts}</td>
+      <td>${(a.serials || []).length}${a.hologramPart ? `<span class="as-sub">Hologram from: ${aesc(a.hologramPart)}${a.hologramPartBelongs ? ' (' + aesc(a.hologramPartBelongs) + ')' : ''}</span>` : ''}</td>
+      <td>${statusPill(a)}</td>
+      <td>${(a.approvedSerials || []).length}/${(a.serials || []).length}</td>
+      <td>${aesc(asmDate(a.createdAt))}</td>
+      <td>${aesc(a.id)}</td></tr>`;
+  }).join('');
+}
+
+function asmPaint() {
+  const list = asmFiltered();
+  const body = document.getElementById('asCvBody');
+  if (!body) return;
+  body.innerHTML = asmRowsHtml(list);
+  document.getElementById('asCvCount').textContent = `${list.length} of ${asmCV.base.length} ${asmCV.type === 'parts' ? 'part(s)' : 'assembly(ies)'}`;
+  body.querySelectorAll('tr.clk').forEach(tr => tr.addEventListener('click', () => openViewAssemblyModal(tr.dataset.id)));
+}
+
+function asmCsvCell(v) {
+  const t = String(v ?? '');
+  return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+}
+function asmDownloadCsv(head, rows, fileBase) {
+  if (a4Intercept(head, rows, fileBase)) return;
+  const csv = '﻿' + [head, ...rows].map(r => r.map(asmCsvCell).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = `${fileBase}_${todayStr()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+function asmExportAssemblies(list, fileBase) {
+  const head = ['Assembly ID', 'Product Name', 'Model No.', 'Quantity',
+    'Parts Used (name x qty - source - belongs to)', 'Parts Source', 'Hologram Part', 'Hologram Part Belongs To',
+    'Status', 'Serials Approved', 'Total Serials', 'Created', 'Serial (Hologram) Numbers'];
+  const rows = list.map(a => [
+    a.id, a.productName, a.modelNumber || '', a.quantity,
+    (a.partsUsed || []).map(p => `${p.name} x ${p.quantity} - ${p.source === 'local' ? 'Local' : 'Inventory'}${p.belongsTo ? ' - belongs to ' + p.belongsTo : ''}`).join(' | '),
+    ASM_SOURCE_LABEL[asmSource(a)], a.hologramPart || '', a.hologramPartBelongs || '',
+    ASM_STATUS_LABEL[a.status] || a.status, (a.approvedSerials || []).length, (a.serials || []).length,
+    asmDate(a.createdAt), asmSerialText(a)]);
+  asmDownloadCsv(head, rows, fileBase);
+}
+function asmExportParts(list, fileBase) {
+  asmDownloadCsv(['Part', 'Belongs To', 'Hologram-tagged in Stock', 'Total Qty'],
+    list.map(p => [p.part_name, partBelongs(p) || '', p.hologram_available ?? 0, p.quantity ?? 0]), fileBase);
+}
+
+function openAssemblyCardDetailModal(type) {
+  const modal = document.getElementById('assemblyCardDetailModal');
+  if (!modal) return;
+  asmEnsureStyles();
+  const [title, base] = asmBase(type);
+  asmCV.type = type; asmCV.title = title; asmCV.base = base; asmCV.f = {};
+  const uniq = arr => [...new Set(arr.filter(Boolean))].sort();
+  const opt = arr => arr.map(v => `<option value="${aesc(v)}">${aesc(v)}</option>`).join('');
+  const isParts = type === 'parts';
+
+  const filters = isParts ? `
+      <input type="text" id="asF_q" placeholder="Search part or belongs-to...">
+      <select id="asF_belongs"><option value="">All Belongs To</option>${opt(uniq(base.map(p => partBelongs(p))))}</select>
+      <select id="asF_stock"><option value="">All Stock</option><option value="tagged">Hologram-tagged in stock</option><option value="none">No tagged stock</option></select>`
+    : `
+      <input type="text" id="asF_q" placeholder="Search product, ID, part, serial...">
+      <select id="asF_status"><option value="">All Status</option>${Object.entries(ASM_STATUS_LABEL).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+      <select id="asF_source"><option value="">All Part Sources</option><option value="inventory">Inventory</option><option value="local">Local</option><option value="both">Inventory + Local</option></select>
+      <select id="asF_product"><option value="">All Products</option>${opt(uniq(base.map(a => a.productName)))}</select>
+      <label style="font-size:12px;color:#64748b;">Created</label>
+      <input type="date" id="asF_from" title="From"><input type="date" id="asF_to" title="To">`;
+
+  const head = isParts
+    ? ['Part', 'Belongs To', 'Hologram-tagged in Stock', 'Total Qty']
+    : ['Product', 'Qty', 'Parts Used', 'Serials', 'Status', 'Approved', 'Created', 'Assembly ID'];
+
+  const content = modal.querySelector('.modal-content');
+  content.style.width = 'min(1100px,96vw)';
+  content.innerHTML = `
+    <div class="as-head"><h3>${aesc(title)}</h3>
+      <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button></div>
+    <div class="as-bar">${filters}
+      <button class="as-btn rst" id="asF_reset">Reset</button>
+      <button class="as-btn exp" id="asF_export"><i class="fa-solid fa-download"></i> Export CSV</button>
+    </div>
+    <p class="as-count" id="asCvCount"></p>
+    <div class="as-wrap"><table class="as-tbl">
+      <thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+      <tbody id="asCvBody"></tbody></table></div>
+    ${isParts ? '' : '<p style="font-size:11.5px;color:#94a3b8;margin-top:8px;">Click a row to see full assembly details.</p>'}`;
+
+  content.querySelector('.close').addEventListener('click', () => closeModal('assemblyCardDetailModal'));
+  content.querySelectorAll('.as-bar select,.as-bar input').forEach(el => {
+    const key = el.id.replace('asF_', '');
+    el.addEventListener(el.type === 'text' ? 'input' : 'change', () => { asmCV.f[key] = el.value; asmPaint(); });
+  });
+  content.querySelector('#asF_reset').addEventListener('click', () => {
+    asmCV.f = {};
+    content.querySelectorAll('.as-bar select,.as-bar input').forEach(el => el.value = '');
+    asmPaint();
+  });
+  a4Twin(content.querySelector('#asF_export'), title);
+  content.querySelector('#asF_export').addEventListener('click', () => {
+    const name = title.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    (isParts ? asmExportParts : asmExportAssemblies)(asmFiltered(), name);
+  });
+  asmPaint();
+  openModal('assemblyCardDetailModal');
+}
+
+function wireAssemblyCardClicks() {
+  document.querySelectorAll('[data-card-filter]').forEach(card => {
+    card.addEventListener('click', () => openAssemblyCardDetailModal(card.dataset.cardFilter));
+  });
+}
+
+// product/model a spare part belongs to (backend field name tolerant)
+function partBelongs(p) {
+  return p.belongs_to || p.belongs_to_product || p.part_belongs_to || p.product_name || p.parent_product || '';
+}
+
+// inventory parts are identified by part name + the product they belong to
+const PART_SEP = '||';
+function partKey(name, belongs) { return (name || '') + PART_SEP + (belongs || ''); }
 
 function sourceLabel(p) {
   return p.source === 'local' ? 'Local parts' : 'Inventory (spare parts)';
@@ -134,12 +381,10 @@ function statusPill(a) {
   return '<span class="status pending">Pending</span>';
 }
 
-function renderTable() {
-  const tbody = document.getElementById('assemblyTbody');
+function asmTableRows() {
   const statusFilter = document.getElementById('statusFilter').value;
   const search = (document.getElementById('assemblySearch').value || '').toLowerCase();
-
-  const rows = assemblies.filter(a => {
+  return assemblies.filter(a => {
     if (statusFilter && a.status !== statusFilter) return false;
     if (search) {
       const hay = (a.productName + ' ' + a.productId + ' ' + (a.serials || []).map(s => s.serial).join(' ')).toLowerCase();
@@ -147,9 +392,14 @@ function renderTable() {
     }
     return true;
   });
+}
+
+function renderTable() {
+  const tbody = document.getElementById('assemblyTbody');
+  const rows = asmTableRows();
 
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:24px;">No assemblies yet</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:24px;">No assemblies yet</td></tr>`;
     return;
   }
 
@@ -159,11 +409,10 @@ function renderTable() {
     const usesLocal = (a.partsUsed || []).some(p => p.source === 'local');
     const sourceSummary = usesInventory && usesLocal ? 'Inventory + Local'
       : usesInventory ? 'Inventory (spare parts)'
-      : usesLocal ? 'Local parts' : '—';
+        : usesLocal ? 'Local parts' : '—';
     return `
       <tr>
         <td>${a.productName}</td>
-        <td>${a.productId || '—'}</td>
         <td>${a.modelNumber || '—'}</td>
         <td>${a.quantity}</td>
         <td>${sourceSummary}</td>
@@ -201,7 +450,7 @@ function openViewAssemblyModal(id) {
       <h3>Assembly Details</h3>
       <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
     </div>
-    <div class="detail"><small>Product</small><p>${a.productName} (${a.productId || '—'})</p></div>
+    <div class="detail"><small>Product</small><p>${a.productName}</p></div>
     <div class="detail"><small>Model Number</small><p>${a.modelNumber || '—'}</p></div>
     <div class="detail"><small>Quantity</small><p>${a.quantity}</p></div>
     ${(a.editHistory || []).length ? (() => {
@@ -211,14 +460,14 @@ function openViewAssemblyModal(id) {
     <hr style="margin:14px 0;border:none;border-top:1px solid #eef1f6;">
     <h4 style="margin-bottom:8px;">Parts Used</h4>
     <ul style="margin:0 0 14px 18px;font-size:13px;color:#475569;">
-      ${(a.partsUsed || []).map(p => `<li>${p.name} — qty ${p.quantity} <span style="color:#94a3b8;">(${sourceLabel(p)})</span></li>`).join('') || '<li style="color:#94a3b8;">No parts recorded</li>'}
+      ${(a.partsUsed || []).map(p => `<li>${p.name}${p.belongsTo ? ` <span style="color:#1665ff;">[Belongs to: ${p.belongsTo}]</span>` : ''} — qty ${p.quantity} <span style="color:#94a3b8;">(${sourceLabel(p)})</span></li>`).join('') || '<li style="color:#94a3b8;">No parts recorded</li>'}
     </ul>
     <h4 style="margin-bottom:8px;">Serial / Hologram Numbers</h4>
     <div style="max-height:220px;overflow-y:auto;border:1px solid #eef1f6;border-radius:10px;">
       <table style="width:100%;font-size:13px;">
-        <thead><tr><th style="text-align:left;padding:8px;">#</th><th style="text-align:left;padding:8px;">Serial No.</th><th style="text-align:left;padding:8px;">Hologram No.</th>${a.status !== 'pending' ? '<th style="text-align:left;padding:8px;">Approval</th>' : ''}</tr></thead>
+        <thead><tr><th style="text-align:left;padding:8px;">#</th><th style="text-align:left;padding:8px;">Serial No.</th><th style="text-align:left;padding:8px;">Hologram No.</th><th style="text-align:left;padding:8px;">Lot No.</th>${a.status !== 'pending' ? '<th style="text-align:left;padding:8px;">Approval</th>' : ''}</tr></thead>
         <tbody>
-          ${(a.serials || []).map((s, i) => `<tr><td style="padding:6px 8px;">${i + 1}</td><td style="padding:6px 8px;">${s.serial}</td><td style="padding:6px 8px;">${s.hologram}</td>${a.status !== 'pending' ? `<td style="padding:6px 8px;">${(a.approvedSerials || []).includes(s.serial) ? '<span style="color:#16a34a;">✔ Received</span>' : '<span style="color:#d97706;">Not received</span>'}</td>` : ''}</tr>`).join('')}
+          ${(a.serials || []).map((s, i) => `<tr><td style="padding:6px 8px;">${i + 1}</td><td style="padding:6px 8px;">${s.serial}</td><td style="padding:6px 8px;">${s.hologram}</td><td style="padding:6px 8px;">${s.lot ? aesc(s.lot) : '—'}</td>${a.status !== 'pending' ? `<td style="padding:6px 8px;">${(a.approvedSerials || []).includes(s.serial) ? '<span style="color:#16a34a;">✔ Received</span>' : '<span style="color:#d97706;">Not received</span>'}</td>` : ''}</tr>`).join('')}
         </tbody>
       </table>
     </div>
@@ -261,6 +510,7 @@ function openApproveAssemblyModal(id) {
           <th style="padding:8px;width:40px;"><input type="checkbox" id="apprAll"></th>
           <th style="text-align:left;padding:8px;">Serial No.</th>
           <th style="text-align:left;padding:8px;">Hologram No.</th>
+          <th style="text-align:left;padding:8px;">Lot No.</th>
           <th style="text-align:left;padding:8px;">Status</th>
         </tr></thead>
         <tbody>
@@ -268,6 +518,7 @@ function openApproveAssemblyModal(id) {
             <td style="padding:6px 8px;"><input type="checkbox" class="apprChk" value="${s.serial}" ${done.has(s.serial) ? 'checked disabled' : ''}></td>
             <td style="padding:6px 8px;">${s.serial}</td>
             <td style="padding:6px 8px;">${s.hologram}</td>
+            <td style="padding:6px 8px;">${s.lot ? aesc(s.lot) : '—'}</td>
             <td style="padding:6px 8px;">${done.has(s.serial) ? '<span style="color:#16a34a;">✔ Approved</span>' : '<span style="color:#d97706;">Not received</span>'}</td>
           </tr>`).join('')}
         </tbody>
@@ -345,7 +596,7 @@ function exportAssemblySerials(id) {
 }
 
 function exportSerialsToExcel(serials, productName) {
-  const rows = serials.map((s, i) => ({ 'Unit #': i + 1, 'Serial Number': s.serial, 'Hologram Number': s.hologram }));
+  const rows = serials.map((s, i) => ({ 'Unit #': i + 1, 'Serial Number': s.serial, 'Hologram Number': s.hologram, 'Lot No.': s.lot || '' }));
   const ws = XLSX.utils.json_to_sheet(rows);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Serials');
@@ -376,6 +627,10 @@ function stepDots(active) {
     </div>`;
 }
 
+// Product ID is never typed in by hand — every assembly / assembled product
+// uses this fixed value (a single space).
+const DEFAULT_PRODUCT_ID = ' ';
+
 async function loadInventoryProducts() {
   try {
     const res = await apiFetch('/inventory/');
@@ -383,14 +638,14 @@ async function loadInventoryProducts() {
     const data = await res.json();
     const seen = new Set();
     inventoryProducts = (data.dataset || [])
-      .filter(p => (p.product_type || 'product') === 'product' && p.product_name && p.product_id)
+      .filter(p => (p.product_type || 'product') === 'product' && p.product_name)
       .filter(p => {
-        const k = `${p.product_id}||${p.model_no || ''}||${p.product_name}`;
+        const k = `${p.model_no || ''}||${p.product_name}`;
         if (seen.has(k)) return false;
         seen.add(k);
         return true;
       })
-      .map(p => ({ name: p.product_name, id: p.product_id, model: p.model_no || '' }))
+      .map(p => ({ name: p.product_name, model: p.model_no || '' }))
       .sort((a, b) => a.name.localeCompare(b.name));
   } catch (err) {
     console.warn('assembly: could not load inventory products', err.message);
@@ -400,8 +655,8 @@ async function loadInventoryProducts() {
 async function openAddAssemblyModal() {
   assemblyDraft = {
     mode: 'existing',   // 'existing' = pick from inventory, 'new' = type details
-    productName: '', productId: '', modelNumber: '', quantity: 1,
-    partsUsed: [], serials: [],
+    productName: '', productId: DEFAULT_PRODUCT_ID, modelNumber: '', quantity: 1,
+    partsUsed: [], serials: [], lots: [],   // lots[i] = lot no. of unit i (compulsory, may differ per unit)
   };
   assemblyStep = 1;
   await Promise.all([loadAvailableParts(), loadInventoryProducts()]);   // refresh stock right before the wizard opens
@@ -436,14 +691,12 @@ function renderAStep1() {
       ${assemblyDraft.mode === 'existing' ? `
         <select id="a1Existing" required>
           <option value="">Choose product from inventory...</option>
-          ${inventoryProducts.map((p, i) => `<option value="${i}" ${p.id === assemblyDraft.productId && p.model === assemblyDraft.modelNumber && p.name === assemblyDraft.productName ? 'selected' : ''}>${escAttr(p.name)} — ${escAttr(p.id)}${p.model ? ' — ' + escAttr(p.model) : ''}</option>`).join('')}
+          ${inventoryProducts.map((p, i) => `<option value="${i}" ${p.model === assemblyDraft.modelNumber && p.name === assemblyDraft.productName ? 'selected' : ''}>${escAttr(p.name)}${p.model ? ' — ' + escAttr(p.model) : ''}</option>`).join('')}
         </select>
         <input id="a1ProductName" placeholder="Product Name" value="${escAttr(assemblyDraft.productName)}" readonly style="background:#f1f5f9;">
-        <input id="a1ProductId" placeholder="Product ID" value="${escAttr(assemblyDraft.productId)}" readonly style="background:#f1f5f9;">
         <input id="a1ModelNumber" placeholder="Model Number" value="${escAttr(assemblyDraft.modelNumber)}" readonly style="background:#f1f5f9;">
       ` : `
         <input id="a1ProductName" placeholder="Product Name" value="${escAttr(assemblyDraft.productName)}" required>
-        <input id="a1ProductId" placeholder="Product ID" value="${escAttr(assemblyDraft.productId)}">
         <input id="a1ModelNumber" placeholder="Model Number" value="${escAttr(assemblyDraft.modelNumber)}">
       `}
       <label style="font-size:13px;color:#64748b;">Quantity to Assemble</label>
@@ -463,7 +716,7 @@ function renderAStep1() {
       return;
     }
     assemblyDraft.mode = btn.dataset.mode;
-    assemblyDraft.productName = assemblyDraft.productId = assemblyDraft.modelNumber = '';
+    assemblyDraft.productName = assemblyDraft.modelNumber = '';
     assemblyDraft.quantity = Math.max(1, Number(document.getElementById('a1Quantity').value) || 1);
     renderAStep1();
   }));
@@ -471,7 +724,6 @@ function renderAStep1() {
   if (existingSel) existingSel.addEventListener('change', () => {
     const p = inventoryProducts[Number(existingSel.value)];
     document.getElementById('a1ProductName').value = p ? p.name : '';
-    document.getElementById('a1ProductId').value = p ? p.id : '';
     document.getElementById('a1ModelNumber').value = p ? p.model : '';
   });
   box.querySelector('#aStep1Form').addEventListener('submit', (e) => {
@@ -481,7 +733,7 @@ function renderAStep1() {
       return;
     }
     assemblyDraft.productName = document.getElementById('a1ProductName').value.trim();
-    assemblyDraft.productId = document.getElementById('a1ProductId').value.trim();
+    assemblyDraft.productId = DEFAULT_PRODUCT_ID;
     assemblyDraft.modelNumber = document.getElementById('a1ModelNumber').value.trim();
     assemblyDraft.quantity = Math.max(1, Number(document.getElementById('a1Quantity').value) || 1);
     assemblyStep = 2;
@@ -527,14 +779,16 @@ function renderAStep2() {
 
   box.querySelector('#addInvPartBtn').addEventListener('click', () => {
     if (!availableParts.length) return;
+    syncPartsUsedFromDom();
     const first = availableParts[0];
     // default quantity to the assembly quantity — that's the 1:1 rule for
     // whichever part ends up supplying the hologram numbers; still editable
-    assemblyDraft.partsUsed.push({ name: first.part_name, quantity: assemblyDraft.quantity, source: 'inventory' });
+    assemblyDraft.partsUsed.push({ name: first.part_name, quantity: assemblyDraft.quantity, source: 'inventory', belongsTo: partBelongs(first) });
     renderPartsUsedRows();
   });
   box.querySelector('#addLocalPartBtn').addEventListener('click', () => {
-    assemblyDraft.partsUsed.push({ name: '', quantity: '', source: 'local' });
+    syncPartsUsedFromDom();
+    assemblyDraft.partsUsed.push({ name: '', quantity: '', source: 'local', belongsTo: '' });
     renderPartsUsedRows();
   });
 
@@ -555,7 +809,8 @@ function renderAStep2() {
     // that's how /assembly/create sums them up server-side
     const summedByName = {};
     inventoryParts.forEach(p => {
-      summedByName[p.name] = (summedByName[p.name] || 0) + Number(p.quantity || 0);
+      const k = partKey(p.name, p.belongsTo);
+      summedByName[k] = (summedByName[k] || 0) + Number(p.quantity || 0);
     });
     // only block when NOT ENOUGH (kam) — no part reaches the assembly
     // quantity. If more than one part qualifies (zyada), that's fine: the
@@ -583,16 +838,21 @@ function renderPartsUsedRows() {
     if (p.source === 'inventory') {
       // a part this assembly already uses may have dropped out of the available
       // list (stock fully consumed) — keep it selectable so edits don't lose it
-      const missing = p.name && !availableParts.some(sp => sp.part_name === p.name)
-        ? `<option value="${p.name}" selected>${p.name} (0 left in stock)</option>` : '';
+      const isSel = sp => sp.part_name === p.name && (partBelongs(sp) === (p.belongsTo || '') || !p.belongsTo);
+      const missing = p.name && !availableParts.some(isSel)
+        ? `<option value="${partKey(p.name, p.belongsTo)}" selected>${p.name}${p.belongsTo ? ' — ' + p.belongsTo : ''} (0 left in stock)</option>` : '';
       nameField = `
         <select class="partUsedName" style="flex:2;">
           ${missing}
-          ${availableParts.map(sp => `<option value="${sp.part_name}" ${sp.part_name === p.name ? 'selected' : ''}>${sp.part_name} (${sp.hologram_available} hologram-tagged in stock)</option>`).join('')}
+          ${availableParts.map(sp => `<option value="${partKey(sp.part_name, partBelongs(sp))}" ${(isSel(sp) && !(p.belongsTo ? false : availableParts.find(isSel) !== sp)) ? 'selected' : ''}>${sp.part_name}${partBelongs(sp) ? ' — ' + partBelongs(sp) : ''} (${sp.hologram_available} hologram-tagged in stock)</option>`).join('')}
         </select>`;
     } else {
       nameField = `<input type="text" class="partUsedName" placeholder="Part Name" value="${p.name}" style="flex:2;">`;
     }
+
+    const belongsField = p.source === 'inventory'
+      ? `<span class="partBelongs" style="flex:1.2;font-size:12px;color:#475569;background:#f1f5f9;border-radius:6px;padding:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="Belongs to">${p.belongsTo || '—'}</span>`
+      : `<input type="text" class="partUsedBelongs" placeholder="Belongs to" value="${p.belongsTo || ''}" style="flex:1.2;">`;
 
     return `
       <div style="display:flex;gap:8px;align-items:center;" data-part-row="${i}">
@@ -600,6 +860,7 @@ function renderPartsUsedRows() {
           ${p.source === 'inventory' ? 'INVENTORY' : 'LOCAL'}
         </span>
         ${nameField}
+        ${belongsField}
         <input type="number" min="0" class="partUsedQty" placeholder="Qty" value="${p.quantity}" style="flex:1;">
         <button type="button" class="removePartUsedBtn" data-index="${i}" style="border:none;background:#fee2e2;color:#dc2626;border-radius:8px;width:36px;height:36px;cursor:pointer;">
           <i class="fa-solid fa-xmark"></i>
@@ -621,15 +882,29 @@ function syncPartsUsedFromDom() {
   if (!wrap) return;
   wrap.querySelectorAll('[data-part-row]').forEach(row => {
     const i = Number(row.dataset.partRow);
-    assemblyDraft.partsUsed[i].name = row.querySelector('.partUsedName').value.trim();
-    assemblyDraft.partsUsed[i].quantity = row.querySelector('.partUsedQty').value;
+    const nameEl = row.querySelector('.partUsedName');
+    const part = assemblyDraft.partsUsed[i];
+    if (nameEl.tagName === 'SELECT') {
+      // inventory row: option value is "partName||belongsTo"
+      const [n, b] = nameEl.value.split(PART_SEP);
+      part.name = (n || '').trim();
+      part.belongsTo = (b || '').trim();
+    } else {
+      part.name = nameEl.value.trim();
+      const bi = row.querySelector('.partUsedBelongs');
+      part.belongsTo = bi ? bi.value.trim() : (part.belongsTo || '');
+    }
+    part.quantity = row.querySelector('.partUsedQty').value;
   });
 }
 
 // ---------- STEP 3: serial + hologram numbers ----------
 function generateSerialNumbers(quantity, productId) {
   const datePart = todayStr().replace(/-/g, '');
-  const base = (productId || 'PRD').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  // Product ID is a fixed blank value now, so it can't seed the serial prefix —
+  // fall back to the model number (then 'PRD') when the id has nothing usable.
+  const clean = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const base = clean(productId) || clean(assemblyDraft && assemblyDraft.modelNumber) || 'PRD';
   const serials = [];
   for (let i = 1; i <= quantity; i++) {
     const seq = String(i).padStart(4, '0');
@@ -661,6 +936,10 @@ function renderAStep3() {
     const suggestion = generateSerialNumbers(1, assemblyDraft.productId)[0];
     assemblyDraft.serials = Array.from({ length: assemblyDraft.quantity }, (_, i) => i === 0 ? suggestion : '');
   }
+  // one lot number per unit (compulsory). Different units may carry different lot numbers.
+  if (!Array.isArray(assemblyDraft.lots) || assemblyDraft.lots.length !== assemblyDraft.quantity) {
+    assemblyDraft.lots = Array.from({ length: assemblyDraft.quantity }, () => '');
+  }
 
   const hologramPart = (assemblyDraft.partsUsed || []).find(
     p => p.source === 'inventory' && Number(p.quantity) >= Number(assemblyDraft.quantity)
@@ -675,13 +954,18 @@ function renderAStep3() {
     ${stepDots(3)}
     <p style="font-size:13px;color:#64748b;margin-bottom:6px;">
       Enter (or adjust) Unit 1's serial number below, then generate the rest of the batch from it — or fill in / edit every unit by hand.
+      <strong>Lot No. is compulsory for every unit</strong> — one assembly can have more than one lot number.
     </p>
     <p style="font-size:12px;color:#005ca9;background:#eef3fb;border-radius:8px;padding:8px 10px;margin-bottom:10px;">
       <i class="fa-solid fa-circle-info"></i>
       Hologram numbers aren't entered here — each unit will automatically get the next hologram number on file for
       <strong>${hologramPart ? hologramPart.name : 'the inventory part'}</strong> when you save.
     </p>
-    <div style="display:flex;justify-content:flex-end;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-bottom:8px;flex-wrap:wrap;align-items:center;">
+      <input type="text" id="lotAllInput" placeholder="Lot No. for all units" style="padding:6px 10px;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;width:170px;">
+      <button type="button" id="lotAllBtn" style="padding:6px 12px;border:1px solid #e2e8f0;border-radius:8px;background:#fff;cursor:pointer;font-size:12px;">
+        <i class="fa-solid fa-tag"></i> Apply Lot No. to all
+      </button>
       <button type="button" id="genFromUnit1Btn" style="padding:6px 12px;border:none;border-radius:8px;background:#1665ff;color:#fff;cursor:pointer;font-size:12px;">
         <i class="fa-solid fa-arrow-down-9-1"></i> Generate Remaining From Unit 1
       </button>
@@ -692,7 +976,7 @@ function renderAStep3() {
     <div style="max-height:280px;overflow-y:auto;border:1px solid #eef1f6;border-radius:10px;">
       <table style="width:100%;font-size:13px;border-collapse:collapse;">
         <thead style="position:sticky;top:0;background:#f8fafc;">
-          <tr><th style="text-align:left;padding:8px;">#</th><th style="text-align:left;padding:8px;">Serial Number</th></tr>
+          <tr><th style="text-align:left;padding:8px;">#</th><th style="text-align:left;padding:8px;">Serial Number</th><th style="text-align:left;padding:8px;">Lot No. <span style="color:#d62828;">*</span></th></tr>
         </thead>
         <tbody id="serialRows"></tbody>
       </table>
@@ -720,6 +1004,17 @@ function renderAStep3() {
     renderSerialRows();
   });
 
+  box.querySelector('#lotAllBtn').addEventListener('click', () => {
+    syncSerialsFromDom();
+    const lot = box.querySelector('#lotAllInput').value.trim();
+    if (!lot) {
+      showResponseModal('Enter a Lot No.', 'Type the Lot No. first, then apply it to all units. You can still change any unit\'s lot afterwards.', false);
+      return;
+    }
+    assemblyDraft.lots = assemblyDraft.lots.map(() => lot);
+    renderSerialRows();
+  });
+
   box.querySelector('#regenSerialsBtn').addEventListener('click', () => {
     assemblyDraft.serials = generateSerialNumbers(assemblyDraft.quantity, assemblyDraft.productId);
     renderSerialRows();
@@ -735,6 +1030,7 @@ function renderSerialRows() {
     <tr data-serial-row="${i}">
       <td style="padding:6px 8px;">${i + 1}${i === 0 ? ' <span style="color:#94a3b8;font-size:11px;">(seed)</span>' : ''}</td>
       <td style="padding:6px 8px;"><input type="text" class="serialInput" placeholder="Serial Number" value="${s}" style="width:100%;"></td>
+      <td style="padding:6px 8px;"><input type="text" class="lotInput" placeholder="Lot No. (required)" value="${escAttr((assemblyDraft.lots || [])[i] || '')}" style="width:100%;"></td>
     </tr>
   `).join('');
 }
@@ -745,6 +1041,8 @@ function syncSerialsFromDom() {
   tbody.querySelectorAll('[data-serial-row]').forEach(row => {
     const i = Number(row.dataset.serialRow);
     assemblyDraft.serials[i] = row.querySelector('.serialInput').value.trim();
+    if (!Array.isArray(assemblyDraft.lots)) assemblyDraft.lots = [];
+    assemblyDraft.lots[i] = row.querySelector('.lotInput').value.trim();
   });
 }
 
@@ -754,6 +1052,13 @@ async function finalizeAssembly() {
 
   if (assemblyDraft.serials.some(s => !s)) {
     showResponseModal('Missing values', 'Every unit needs a serial number.', false);
+    return;
+  }
+  // Lot No. is compulsory for every unit. Deliberately NO uniqueness / consistency check on lots:
+  // one assembly may carry several lot numbers, and the same lot can repeat across units.
+  const lotMissing = (assemblyDraft.lots || []).findIndex(l => !String(l || '').trim());
+  if (lotMissing !== -1 || (assemblyDraft.lots || []).length !== assemblyDraft.serials.length) {
+    showResponseModal('Lot No. required', `Every unit needs a Lot No.${lotMissing !== -1 ? ' Unit ' + (lotMissing + 1) + ' is missing one.' : ''}`, false);
     return;
   }
   const serialSet = new Set(assemblyDraft.serials);
@@ -795,6 +1100,7 @@ function canEditAssembly() {
 
 let editingAssemblyId = null;
 let editingHologramPart = '';
+let editingHologramBelongs = '';
 
 function escAttr(v) {
   return String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -818,16 +1124,18 @@ async function openEditAssemblyModal(id) {
   // which inventory part supplies the hologram numbers (same rule as the backend)
   const sums = {};
   (a.partsUsed || []).filter(p => p.source !== 'local').forEach(p => {
-    sums[p.name] = (sums[p.name] || 0) + Number(p.quantity || 0);
+    const k = partKey(p.name, p.belongsTo);
+    sums[k] = (sums[k] || 0) + Number(p.quantity || 0);
   });
   editingHologramPart = a.hologramPart
-    || Object.keys(sums).find(name => sums[name] >= Number(a.quantity))
+    || (Object.keys(sums).find(k => sums[k] >= Number(a.quantity)) || '').split(PART_SEP)[0]
     || '';
+  editingHologramBelongs = a.hologramPartBelongs || '';
 
   assemblyDraft = {
-    productName: a.productName || '', productId: a.productId || '', modelNumber: a.modelNumber || '',
+    productName: a.productName || '', productId: DEFAULT_PRODUCT_ID, modelNumber: a.modelNumber || '',
     quantity: a.quantity,
-    partsUsed: (a.partsUsed || []).map(p => ({ name: p.name, quantity: p.quantity, source: p.source === 'local' ? 'local' : 'inventory' })),
+    partsUsed: (a.partsUsed || []).map(p => ({ name: p.name, quantity: p.quantity, belongsTo: p.belongsTo || '', source: p.source === 'local' ? 'local' : 'inventory' })),
     serials: [],
   };
   renderEditAssemblyModal();
@@ -843,7 +1151,6 @@ function renderEditAssemblyModal() {
     </div>
     <div style="display:flex;flex-direction:column;gap:10px;">
       <input id="eProductName" placeholder="Product Name" value="${escAttr(assemblyDraft.productName)}">
-      <input id="eProductId" placeholder="Product ID" value="${escAttr(assemblyDraft.productId)}">
       <input id="eModelNumber" placeholder="Model Number" value="${escAttr(assemblyDraft.modelNumber)}">
       <label style="font-size:13px;color:#64748b;">Quantity to Assemble (cannot be changed)</label>
       <input type="number" value="${assemblyDraft.quantity}" disabled>
@@ -853,7 +1160,7 @@ function renderEditAssemblyModal() {
       <i class="fa-solid fa-circle-info"></i>
       Add, remove or change parts. If an inventory part's quantity goes up, the extra is deducted from inventory;
       if it goes down or the part is removed, the difference is restocked.
-      ${editingHologramPart ? `<strong>${escAttr(editingHologramPart)}</strong> supplies the hologram numbers, so it must stay at ${assemblyDraft.quantity} or more.` : ''}
+      ${editingHologramPart ? `<strong>${escAttr(editingHologramPart)}${editingHologramBelongs ? ' (' + escAttr(editingHologramBelongs) + ')' : ''}</strong> supplies the hologram numbers, so it must stay at ${assemblyDraft.quantity} or more.` : ''}
     </p>
     <div id="partsUsedRows" style="display:flex;flex-direction:column;gap:8px;"></div>
     <div style="display:flex;gap:10px;margin-top:10px;">
@@ -878,12 +1185,12 @@ function renderEditAssemblyModal() {
   box.querySelector('#eAddInvPartBtn').addEventListener('click', () => {
     if (!availableParts.length) return;
     syncPartsUsedFromDom();
-    assemblyDraft.partsUsed.push({ name: availableParts[0].part_name, quantity: 1, source: 'inventory' });
+    assemblyDraft.partsUsed.push({ name: availableParts[0].part_name, quantity: 1, source: 'inventory', belongsTo: partBelongs(availableParts[0]) });
     renderPartsUsedRows();
   });
   box.querySelector('#eAddLocalPartBtn').addEventListener('click', () => {
     syncPartsUsedFromDom();
-    assemblyDraft.partsUsed.push({ name: '', quantity: '', source: 'local' });
+    assemblyDraft.partsUsed.push({ name: '', quantity: '', source: 'local', belongsTo: '' });
     renderPartsUsedRows();
   });
   box.querySelector('#eSaveBtn').addEventListener('click', saveAssemblyEdit);
@@ -908,7 +1215,7 @@ async function saveAssemblyEdit() {
 
   // mirror the backend: the hologram part must stay >= assembly quantity
   const holoTotal = parts
-    .filter(p => p.source === 'inventory' && p.name === editingHologramPart)
+    .filter(p => p.source === 'inventory' && p.name === editingHologramPart && (!editingHologramBelongs || (p.belongsTo || '') === editingHologramBelongs))
     .reduce((sum, p) => sum + Number(p.quantity), 0);
   if (editingHologramPart && holoTotal < Number(assemblyDraft.quantity)) {
     showResponseModal(
@@ -924,7 +1231,7 @@ async function saveAssemblyEdit() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         product_name: productName,
-        product_id: document.getElementById('eProductId').value.trim(),
+        product_id: DEFAULT_PRODUCT_ID,
         model_number: document.getElementById('eModelNumber').value.trim(),
         parts_used: parts.map(p => ({ part_name: p.name, quantity: Number(p.quantity), source: p.source })),
       }),
@@ -957,6 +1264,10 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('addAssemblyBtn').addEventListener('click', openAddAssemblyModal);
   document.getElementById('applyAssemblyFilter').addEventListener('click', renderTable);
   document.getElementById('assemblySearch').addEventListener('input', renderTable);
+  asmEnsureStyles();
+  document.querySelector('.top-actions .export')?.addEventListener('click', () => asmExportAssemblies(asmTableRows(), 'assemblies'));
+  a4Twin(document.querySelector('.top-actions .export'), 'Assemblies');
+  wireAssemblyCardClicks();
   loadAvailableParts();
   loadAssemblies();
 });

@@ -1,3 +1,9 @@
+/* ---- A4 print support: print_a4.js is loaded on demand (safe if it is missing) ---- */
+(function () { if (typeof A4Print === 'undefined' && !document.getElementById('a4printjs')) { const s = document.createElement('script'); s.id = 'a4printjs'; s.src = 'print_a4.js'; document.head.appendChild(s); } })();
+function a4Ready(cb, n) { n = n || 0; if (typeof A4Print !== 'undefined') return cb(); if (n < 50) setTimeout(() => a4Ready(cb, n + 1), 200); }
+function a4Intercept(head, rows, name) { return typeof A4Print !== 'undefined' && A4Print.intercept(head, rows, name); }
+function a4WizardPrint(modal, title) { if (typeof A4Print !== 'undefined') A4Print.wizardPrint(modal, title); }
+function a4Twin(btn, title) { if (btn) a4Ready(() => A4Print.attachTwin(btn, title)); }
 // =========================================================
 // shipment.js
 // Powers pages/shipment.html — cards, table/filtering, and the
@@ -48,11 +54,59 @@ function partStatusLabel(status) {
 
 // server stores snake_case (shipment_id, company_name, dispatch_date, ...);
 // the UI below works with the camelCase shape used while building the wizard.
+const CURRENCIES = { INR: '₹', USD: '$', EUR: '€', GBP: '£', CNY: 'CN¥', JPY: 'JP¥', AED: 'AED ', SGD: 'S$' };
+let companyList = [];
+
+function esc(v) {
+  return String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function curMoney(n, cur) {
+  return (CURRENCIES[cur] || cur + ' ') + (Number(n) || 0).toLocaleString('en-IN');
+}
+function draftTotal(s) {
+  return (s.products || []).reduce((t, p) => t + (Number(p.price) || 0) * (Number(p.quantity) || 0), 0);
+}
+const PAYMENT_LABELS = { paid: 'Paid', partial: 'Partial (part now, rest on credit)', credit: 'Credit' };
+function addDays(dateStr, days) {
+  const d = new Date(dateStr || todayStr());
+  if (isNaN(d)) return '';
+  d.setDate(d.getDate() + (Number(days) || 0));
+  return d.toISOString().slice(0, 10);
+}
+// payment summary for the view modal
+function paymentSummaryHtml(s) {
+  const total = draftTotal(s);
+  const mode = s.paymentMode || 'paid';
+  if (mode === 'paid') return '<div class="detail"><small>Payment</small><p>Paid in full</p></div>';
+  const paid = mode === 'partial' ? (Number(s.paidAmount) || 0) : 0;
+  const due = s.dueDate || addDays(s.dispatchDate, s.creditDays);
+  return `
+    <div class="detail"><small>Payment</small><p>${mode === 'partial' ? 'Partial — part paid, rest on credit' : 'Credit'}</p></div>
+    <div class="detail"><small>Paid now</small><p>${curMoney(paid, s.currency)}</p></div>
+    <div class="detail"><small>On credit (balance)</small><p>${curMoney(Math.max(total - paid, 0), s.currency)}</p></div>
+    <div class="detail"><small>Credit time</small><p>${s.creditDays} day(s) — due ${due || '—'}<br><small style="color:#94a3b8;">Later payments are tracked in Users → Companies.</small></p></div>`;
+}
+async function loadCompanyList() {
+  try {
+    const r = await apiFetch('/customer/company_list');
+    if (r.ok) companyList = (await r.json()).dataset || [];
+  } catch (e) { companyList = []; }
+}
+
 function fromServerShape(s) {
   return {
     id: s.shipment_id || s.id,
     companyName: s.company_name,
     companyAddress: s.company_address,
+    invoiceNo: s.invoice_no || '',
+    customerId: s.customer_id || '',
+    paymentMode: s.payment_mode || 'paid',
+    paidAmount: Number(s.paid_amount) || 0,
+    creditDays: Number(s.credit_days) || 0,
+    dueDate: s.due_date || '',
+    currency: s.currency || 'INR',
+    exchangeRate: Number(s.exchange_rate) || 1,
+    totalInr: s.total_inr,
     dispatchDate: s.dispatch_date,
     receivedDate: s.received_date || '',
     createdAt: s.created_at,
@@ -70,6 +124,17 @@ function toServerShape(s) {
   return {
     company_name: s.companyName,
     company_address: s.companyAddress,
+    invoice_no: s.invoiceNo || '',
+    customer_id: s.customerId || '',
+    gst_number: s.gstNumber || '',
+    contractor_person: s.contactPerson || '',
+    contractor_number: s.contactNumber || '',
+    contractor_email: s.contactEmail || '',
+    payment_mode: s.paymentMode || 'paid',
+    paid_amount: s.paymentMode === 'partial' ? (Number(s.paidAmount) || 0) : 0,
+    credit_days: s.paymentMode === 'paid' ? 0 : (Number(s.creditDays) || 0),
+    currency: s.currency || 'INR',
+    exchange_rate: Number(s.exchangeRate) || 1,
     dispatch_date: s.dispatchDate,
     received_date: s.receivedDate || '',
     products: (s.products || []).map(p => ({
@@ -130,65 +195,219 @@ function renderCards() {
   document.getElementById('cardFY').textContent = fy;
 }
 
-function shipmentCardRowsHtml(list) {
-  if (!list.length) return '<p style="color:#94a3b8;text-align:center;padding:16px;">No shipments to show.</p>';
-  return `<table style="width:100%;font-size:13px;border-collapse:collapse;">
-    <thead><tr style="text-align:left;">
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Company</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Products</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Order Date</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Received Date</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Status</th>
-    </tr></thead>
-    <tbody>${list.map(s => `<tr>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${s.companyName ?? ''}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${productSummary(s.products)}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${s.dispatchDate ? new Date(s.dispatchDate).toLocaleDateString('en-GB') : '-'}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${s.receivedDate ? new Date(s.receivedDate).toLocaleDateString('en-GB') : '-'}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${shipmentStatus(s)}</td>
-    </tr>`).join('')}</tbody>
-  </table>`;
+// =========================================================
+// CARD POPUPS — filters + export + click-through to full details
+// =========================================================
+const shipCV = { title: '', base: [], f: {} };
+
+function shipEnsureStyles() {
+  if (document.getElementById('shipCvStyles')) return;
+  const st = document.createElement('style');
+  st.id = 'shipCvStyles';
+  st.textContent = `
+    #shipmentCardDetailModal{z-index:999}
+    #viewShipmentModal{z-index:1100 !important}
+    .sh-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+    .sh-head h3{margin:0}
+    .sh-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+    .sh-bar select,.sh-bar input{padding:7px 9px;border:1px solid #e2e8f0;border-radius:8px;font-size:12.5px;background:#fff;min-width:0}
+    .sh-bar input[type=text]{flex:1;min-width:150px}
+    .sh-btn{padding:8px 12px;border:none;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600}
+    .sh-btn.exp{background:#1665ff;color:#fff}
+    .sh-btn.rst{background:#eef1f6;color:#334155}
+    .sh-count{font-size:12px;color:#64748b;margin:0 0 8px}
+    .sh-wrap{overflow:auto;max-height:58vh;border:1px solid #eef1f6;border-radius:10px}
+    .sh-tbl{width:100%;font-size:12.5px;border-collapse:collapse;min-width:900px}
+    .sh-tbl th{position:sticky;top:0;background:#f1f5f9 !important;color:#334155 !important;text-align:left;padding:8px 8px;border-bottom:1px solid #e2e8f0;white-space:nowrap}
+    .sh-tbl td{color:#1e293b;padding:8px;border-bottom:1px solid #f1f5f9;vertical-align:top}
+    .sh-tbl tbody tr{cursor:pointer}
+    .sh-tbl tbody tr:hover{background:#f8fbff}
+    .sh-sub{display:block;font-size:11px;color:#64748b;margin-top:1px}
+    .sh-line{margin-bottom:6px}
+    .sh-line:last-child{margin-bottom:0}
+    .sh-chip{display:inline-block;font-size:10.5px;padding:1px 7px;border-radius:99px;background:#eef2ff;color:#3730a3;margin-left:4px}
+    .sh-chip.purchase{background:#fff7ed;color:#9a3412}
+    .sh-chip.warranty{background:#ecfdf5;color:#065f46}
+    .sh-pill{padding:2px 9px;border-radius:99px;font-size:11.5px;font-weight:600}
+    .sh-pill.received{background:#dcfce7;color:#166534}
+    .sh-pill.pending{background:#fef3c7;color:#92400e}
+  `;
+  document.head.appendChild(st);
+}
+
+function shipFmtDate(d) {
+  if (!d) return '-';
+  const x = new Date(d);
+  return isNaN(x) ? String(d) : x.toLocaleDateString('en-GB');
+}
+function shipTotalInr(s) {
+  return Number(s.totalInr) || Math.round(draftTotal(s) * (Number(s.exchangeRate) || 1) * 100) / 100;
+}
+function shipPaymentText(s) {
+  const m = s.paymentMode || 'paid';
+  if (m === 'paid') return 'Paid';
+  if (m === 'partial') return 'Partial';
+  return 'Credit';
+}
+function shipPartsOf(s) {
+  const out = [];
+  (s.products || []).forEach(p => (p.parts || []).forEach(pt =>
+    out.push({ product: p.name, name: pt.name, qty: pt.quantity, status: pt.status || 'assembly' })));
+  return out;
+}
+
+function shipFiltered() {
+  const f = shipCV.f;
+  const q = (f.q || '').toLowerCase();
+  return shipCV.base.filter(s => {
+    if (f.status && shipmentStatus(s) !== f.status) return false;
+    if (f.payment && (s.paymentMode || 'paid') !== f.payment) return false;
+    if (f.currency && (s.currency || 'INR') !== f.currency) return false;
+    if (f.company && s.companyName !== f.company) return false;
+    if (f.partStatus && !shipPartsOf(s).some(p => p.status === f.partStatus)) return false;
+    if (f.from && (s.dispatchDate || '') < f.from) return false;
+    if (f.to && (s.dispatchDate || '') > f.to) return false;
+    if (q) {
+      const hay = [s.id, s.companyName, s.companyAddress,
+      ...(s.products || []).map(p => p.name),
+      ...shipPartsOf(s).map(p => p.name)].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+function shipRowsHtml(list) {
+  if (!list.length) return '<tr><td colspan="9" style="text-align:center;color:#94a3b8;padding:20px;">No shipments match these filters.</td></tr>';
+  return list.map(s => {
+    const st = shipmentStatus(s);
+    const prods = (s.products || []).map(p => `
+      <div class="sh-line"><b>${esc(p.name)}</b> × ${esc(p.quantity)}
+        <span class="sh-sub">${curMoney(p.price, s.currency)} each${p.warranty ? ' · Warranty: ' + esc(p.warranty) : ''}</span></div>`).join('') || '—';
+    const parts = shipPartsOf(s).map(pt => `
+      <div class="sh-line">${esc(pt.name)} × ${esc(pt.qty)}<span class="sh-chip ${esc(pt.status)}">${esc(partStatusLabel(pt.status))}</span>
+        <span class="sh-sub">Belongs to: ${esc(pt.product)}</span></div>`).join('') || '<span style="color:#94a3b8;">—</span>';
+    const total = draftTotal(s);
+    return `<tr data-id="${esc(s.id)}">
+      <td>${esc(s.id)}</td>
+      <td><b>${esc(s.companyName)}</b><span class="sh-sub">${esc((s.companyAddress || '').slice(0, 50))}</span></td>
+      <td>${prods}</td>
+      <td>${parts}</td>
+      <td>${shipFmtDate(s.dispatchDate)}</td>
+      <td>${shipFmtDate(s.receivedDate)}</td>
+      <td>${shipPaymentText(s)}</td>
+      <td>${curMoney(total, s.currency)}${s.currency !== 'INR' ? `<span class="sh-sub">≈ ${money(shipTotalInr(s))}</span>` : ''}</td>
+      <td><span class="sh-pill ${st}">${st === 'received' ? 'Received' : 'Pending'}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function shipPaintCard() {
+  const list = shipFiltered();
+  const body = document.getElementById('shCvBody');
+  if (!body) return;
+  body.innerHTML = shipRowsHtml(list);
+  document.getElementById('shCvCount').textContent = `${list.length} of ${shipCV.base.length} shipment(s)`;
+  body.querySelectorAll('tr[data-id]').forEach(tr => tr.addEventListener('click', () => openViewModal(tr.dataset.id)));
+}
+
+function shipCsvCell(v) {
+  const t = String(v ?? '');
+  return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+}
+function shipExportCsv(list, fileBase) {
+  const head = ['Shipment ID', 'Company', 'Address', 'Products (name x qty @ price)', 'Warranty',
+    'Parts (name x qty - type - belongs to)', 'Dispatch Date', 'Received Date', 'Status',
+    'Payment', 'Currency', 'Total', 'Total (INR)', 'Paid Amount', 'Credit Days', 'Due Date'];
+  const rows = list.map(s => [
+    s.id, s.companyName, s.companyAddress || '',
+    (s.products || []).map(p => `${p.name} x ${p.quantity} @ ${p.price}`).join(' | '),
+    (s.products || []).filter(p => p.warranty).map(p => `${p.name}: ${p.warranty}`).join(' | '),
+    shipPartsOf(s).map(p => `${p.name} x ${p.qty} - ${partStatusLabel(p.status)} - belongs to ${p.product}`).join(' | '),
+    s.dispatchDate || '', s.receivedDate || '', shipmentStatus(s),
+    shipPaymentText(s), s.currency || 'INR', draftTotal(s), shipTotalInr(s),
+    s.paymentMode === 'partial' ? (s.paidAmount || 0) : (s.paymentMode === 'paid' ? draftTotal(s) : 0),
+    s.paymentMode === 'paid' ? '' : (s.creditDays || ''),
+    s.paymentMode === 'paid' ? '' : (s.dueDate || addDays(s.dispatchDate, s.creditDays))
+  ]);
+  if (a4Intercept(head, rows, fileBase)) return;
+  const csv = '﻿' + [head, ...rows].map(r => r.map(shipCsvCell).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = `${fileBase}_${todayStr()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+
+function shipCardBase(type) {
+  const now = new Date();
+  const fy = currentFYRange();
+  const inFY = s => { const d = new Date(s.createdAt || s.dispatchDate); return d >= fy.start && d <= fy.end; };
+  switch (type) {
+    case 'thisMonth': return ['This Month Shipment', shipments.filter(s => {
+      const d = new Date(s.createdAt || s.dispatchDate);
+      return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+    })];
+    case 'today': return ['Today Shipment', shipments.filter(s => (s.createdAt || '').slice(0, 10) === todayStr())];
+    case 'received': return ['Received Shipment', shipments.filter(s => shipmentStatus(s) === 'received')];
+    case 'pending': return ['Pending Shipment', shipments.filter(s => shipmentStatus(s) === 'pending')];
+    case 'fy': return ['Financial Year Shipment', shipments.filter(inFY)];
+    default: return ['Shipments', shipments];
+  }
 }
 
 function openShipmentCardDetailModal(type) {
   const modal = document.getElementById('shipmentCardDetailModal');
   if (!modal) return;
+  shipEnsureStyles();
+  const [title, base] = shipCardBase(type);
+  shipCV.title = title;
+  shipCV.base = base;
+  shipCV.f = { status: '', payment: '', currency: '', company: '', partStatus: '', from: '', to: '', q: '' };
+  const companies = [...new Set(base.map(s => s.companyName).filter(Boolean))].sort();
+  const currencies = [...new Set(base.map(s => s.currency || 'INR'))].sort();
+  const opt = (arr) => arr.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+
   const content = modal.querySelector('.modal-content');
-  const now = new Date();
-  const fyRange = currentFYRange();
-
-  let title = '';
-  let list = shipments;
-  if (type === 'thisMonth') {
-    title = 'This Month Shipment';
-    list = shipments.filter(s => {
-      const d = new Date(s.createdAt || s.dispatchDate);
-      return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-    });
-  } else if (type === 'today') {
-    title = 'Today Shipment';
-    list = shipments.filter(s => (s.createdAt || '').slice(0, 10) === todayStr());
-  } else if (type === 'received') {
-    title = 'Received Shipment';
-    list = shipments.filter(s => shipmentStatus(s) === 'received');
-  } else if (type === 'pending') {
-    title = 'Pending Shipment';
-    list = shipments.filter(s => shipmentStatus(s) === 'pending');
-  } else if (type === 'fy') {
-    title = 'Financial Year Shipment';
-    list = shipments.filter(s => {
-      const d = new Date(s.createdAt || s.dispatchDate);
-      return d >= fyRange.start && d <= fyRange.end;
-    });
-  }
-
+  content.style.width = 'min(1100px,95vw)';
   content.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-      <h3>${title}</h3>
-      <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
+    <div class="sh-head"><h3>${esc(title)}</h3>
+      <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button></div>
+    <div class="sh-bar">
+      <input type="text" id="shF_q" placeholder="Search company, product, part, ID...">
+      ${currencies.length > 1 ? '' : ''}
+      <select id="shF_status"><option value="">All Status</option><option value="pending">Pending</option><option value="received">Received</option></select>
+      <select id="shF_payment"><option value="">All Payment</option><option value="paid">Paid</option><option value="partial">Partial</option><option value="credit">Credit</option></select>
+      <select id="shF_currency"><option value="">All Currency</option>${opt(currencies)}</select>
+      <select id="shF_company"><option value="">All Companies</option>${opt(companies)}</select>
+      <select id="shF_partStatus"><option value="">All Part Types</option><option value="assembly">Assembly</option><option value="purchase">Purchase</option><option value="warranty">Warranty</option></select>
+      <label style="font-size:12px;color:#64748b;">Dispatch</label>
+      <input type="date" id="shF_from" title="From"><input type="date" id="shF_to" title="To">
+      <button class="sh-btn rst" id="shF_reset">Reset</button>
+      <button class="sh-btn exp" id="shF_export"><i class="fa-solid fa-download"></i> Export CSV</button>
     </div>
-    ${shipmentCardRowsHtml(list)}`;
+    <p class="sh-count" id="shCvCount"></p>
+    <div class="sh-wrap"><table class="sh-tbl">
+      <thead><tr><th>Shipment ID</th><th>Company</th><th>Products</th><th>Parts</th><th>Dispatch</th><th>Received</th><th>Payment</th><th>Total</th><th>Status</th></tr></thead>
+      <tbody id="shCvBody"></tbody></table></div>
+    <p style="font-size:11.5px;color:#94a3b8;margin-top:8px;">Click a row to see full shipment details.</p>`;
+
   content.querySelector('.close').addEventListener('click', () => modal.style.display = 'none');
+  ['status', 'payment', 'currency', 'company', 'partStatus', 'from', 'to'].forEach(k => {
+    content.querySelector('#shF_' + k).addEventListener('change', e => { shipCV.f[k] = e.target.value; shipPaintCard(); });
+  });
+  content.querySelector('#shF_q').addEventListener('input', e => { shipCV.f.q = e.target.value; shipPaintCard(); });
+  content.querySelector('#shF_reset').addEventListener('click', () => {
+    shipCV.f = { status: '', payment: '', currency: '', company: '', partStatus: '', from: '', to: '', q: '' };
+    content.querySelectorAll('.sh-bar select,.sh-bar input').forEach(el => el.value = '');
+    shipPaintCard();
+  });
+  a4Twin(content.querySelector('#shF_export'), shipCV.title);
+  content.querySelector('#shF_export').addEventListener('click', () => {
+    shipExportCsv(shipFiltered(), shipCV.title.toLowerCase().replace(/[^a-z0-9]+/g, '_'));
+  });
+  shipPaintCard();
   modal.style.display = 'flex';
 }
 
@@ -205,13 +424,11 @@ function productSummary(products) {
   return `${first.name} x${first.quantity}${extra}`;
 }
 
-function renderTable() {
-  const tbody = document.getElementById('shipmentTbody');
+function shipTableRows() {
   const statusFilter = document.getElementById('statusFilter').value;
   const dateFilter = document.getElementById('dispatchDateFilter').value;
   const search = (document.getElementById('shipmentSearch').value || '').toLowerCase();
-
-  const rows = shipments.filter(s => {
+  return shipments.filter(s => {
     if (statusFilter && shipmentStatus(s) !== statusFilter) return false;
     if (dateFilter && s.dispatchDate !== dateFilter) return false;
     if (search) {
@@ -220,6 +437,11 @@ function renderTable() {
     }
     return true;
   });
+}
+
+function renderTable() {
+  const tbody = document.getElementById('shipmentTbody');
+  const rows = shipTableRows();
 
   if (!rows.length) {
     tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:24px;">No shipments yet</td></tr>`;
@@ -241,6 +463,7 @@ function renderTable() {
         <td>${pill}</td>
         <td>
           <button class="icon-btn" data-action="view" data-id="${s.id}" title="View"><i class="fa-solid fa-eye"></i></button>
+          <button class="icon-btn" data-action="edit" data-id="${s.id}" title="Edit"><i class="fa-solid fa-pen"></i></button>
           ${status === 'pending' ? `<button class="icon-btn" data-action="receive" data-id="${s.id}" title="Mark Received"><i class="fa-solid fa-truck-ramp-box"></i></button>` : ''}
           <button class="icon-btn" data-action="delete" data-id="${s.id}" title="Delete"><i class="fa-solid fa-trash"></i></button>
         </td>
@@ -248,6 +471,7 @@ function renderTable() {
   }).join('');
 
   tbody.querySelectorAll('[data-action="view"]').forEach(b => b.addEventListener('click', () => openViewModal(b.dataset.id)));
+  tbody.querySelectorAll('[data-action="edit"]').forEach(b => b.addEventListener('click', () => openEditShipmentModal(b.dataset.id)));
   tbody.querySelectorAll('[data-action="receive"]').forEach(b => b.addEventListener('click', () => openReceivedModal(b.dataset.id)));
   tbody.querySelectorAll('[data-action="delete"]').forEach(b => b.addEventListener('click', () => openDeleteModal(b.dataset.id)));
 }
@@ -260,13 +484,18 @@ function openViewModal(id) {
   const s = shipments.find(x => x.id === id);
   if (!s) return;
   const box = document.querySelector('#viewShipmentModal .modal-content');
+  box.style.width = 'min(780px,94vw)';
   box.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
       <h3>Shipment Details</h3>
       <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
     </div>
+    <div class="detail"><small>Shipment ID</small><p>${s.id}</p></div>
     <div class="detail"><small>Company Name</small><p>${s.companyName}</p></div>
     <div class="detail"><small>Company Address</small><p>${s.companyAddress || '—'}</p></div>
+    <div class="detail"><small>Invoice No.</small><p>${s.invoiceNo || '—'}</p></div>
+    ${paymentSummaryHtml(s)}
+    <div class="detail"><small>Total</small><p>${curMoney(draftTotal(s), s.currency)}${s.currency !== 'INR' ? ` ≈ ${money(s.totalInr)} (₹${s.exchangeRate}/${s.currency})` : ''}</p></div>
     <div class="detail"><small>Dispatch Date</small><p>${s.dispatchDate || '—'}</p></div>
     <div class="detail"><small>Received Date</small><p>${s.receivedDate || 'Not received yet'}</p></div>
     <hr style="margin:14px 0;border:none;border-top:1px solid #eef1f6;">
@@ -275,7 +504,7 @@ function openViewModal(id) {
       <div style="border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin-bottom:10px;">
         <div style="display:flex;justify-content:space-between;font-weight:600;">
           <span>${p.name}</span>
-          <span>${money(p.price)} x ${p.quantity}</span>
+          <span>${curMoney(p.price, s.currency)} x ${p.quantity} = ${curMoney((Number(p.price) || 0) * (Number(p.quantity) || 0), s.currency)}</span>
         </div>
         ${p.warranty ? `<p style="font-size:12px;color:#64748b;margin-top:4px;">Warranty: ${p.warranty}</p>` : ''}
         ${(p.parts && p.parts.length) ? `
@@ -394,15 +623,45 @@ function stepDots(active) {
     </div>`;
 }
 
-function openAddShipmentModal() {
+async function openAddShipmentModal() {
+  await loadCompanyList();
   shipmentDraft = {
     id: newId(),
     companyName: '',
     companyAddress: '',
+    invoiceNo: '',
+    invoiceNote: '',
+    customerId: '',
+    gstNumber: '',
+    contactPerson: '',
+    contactNumber: '',
+    contactEmail: '',
+    paymentMode: 'paid',
+    paidAmount: 0,
+    creditDays: '',
+    currency: 'INR',
+    exchangeRate: 1,
+    rateNote: '',
     dispatchDate: todayStr(),
     receivedDate: '',
     products: []
   };
+  shipmentStep = 1;
+  renderShipmentStep();
+  openModal('shipmentModal');
+}
+
+async function openEditShipmentModal(id) {
+  const s = shipments.find(x => x.id === id);
+  if (!s) return;
+  await loadCompanyList();
+  shipmentDraft = JSON.parse(JSON.stringify(s));
+  shipmentDraft.isEdit = true;
+  shipmentDraft.rateNote = '';
+  if (!shipmentDraft.customerId) {
+    const m = companyList.find(c => (c.company_name || '').trim().toLowerCase() === (s.companyName || '').trim().toLowerCase());
+    shipmentDraft.customerId = m ? m.customer_id : '';
+  }
   shipmentStep = 1;
   renderShipmentStep();
   openModal('shipmentModal');
@@ -414,22 +673,110 @@ function renderShipmentStep() {
   return renderStep3();
 }
 
-// ---------- STEP 1: company details ----------
+// ---------- STEP 1: company, payment, currency ----------
+function readStep1() {
+  const g = id => document.getElementById(id);
+  const d = shipmentDraft;
+  if (g('s1Invoice')) d.invoiceNo = g('s1Invoice').value.trim();
+  if (g('s1Dispatch')) d.dispatchDate = g('s1Dispatch').value;
+  if (g('s1ReceivedDate')) d.receivedDate = g('s1ReceivedDate').value;
+  if (g('s1Payment')) d.paymentMode = g('s1Payment').value;
+  if (g('s1CreditDays')) d.creditDays = g('s1CreditDays').value;
+  if (g('s1Rate')) d.exchangeRate = Number(g('s1Rate').value) || 0;
+  if (g('s1CompanyName')) {
+    d.companyName = g('s1CompanyName').value.trim();
+    d.companyAddress = g('s1CompanyAddress').value.trim();
+    d.gstNumber = g('s1Gst').value.trim();
+    d.contactPerson = g('s1ContactPerson').value.trim();
+    d.contactNumber = g('s1ContactNumber').value.trim();
+    d.contactEmail = g('s1ContactEmail').value.trim();
+  }
+}
+
+async function fetchRate() {
+  const d = shipmentDraft;
+  if (d.currency === 'INR') { d.exchangeRate = 1; d.rateNote = ''; return renderStep1(); }
+  d.rateNote = 'Fetching live rate...';
+  renderStep1();
+  try {
+    const r = await apiFetch(`/shipment/fx_rate?currency=${d.currency}`);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'failed');
+    d.exchangeRate = data.rate;
+    d.rateNote = `Live rate: 1 ${d.currency} = ₹${data.rate}`;
+  } catch (e) {
+    d.rateNote = 'Live rate unavailable — enter the rate manually';
+  }
+  renderStep1();
+}
+
 function renderStep1() {
+  const d = shipmentDraft;
   const box = SHIPMENT_MODAL();
+  const picked = companyList.find(c => c.customer_id === d.customerId);
+  const input = (id, ph, val) => `<input id="${id}" placeholder="${ph}" value="${esc(val)}">`;
   box.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-      <h3>Add Shipment</h3>
+      <h3>${d.isEdit ? 'Edit' : 'Add'} Shipment</h3>
       <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
     </div>
     ${stepDots(1)}
     <form id="shipStep1Form" style="display:flex;flex-direction:column;gap:10px;">
-      <input id="s1CompanyName" placeholder="Company Name" value="${shipmentDraft.companyName}" required>
-      <textarea id="s1CompanyAddress" placeholder="Company Address" rows="3" required>${shipmentDraft.companyAddress}</textarea>
+      <label style="font-size:13px;color:#64748b;">Invoice No.</label>
+      <input id="s1Invoice" placeholder="Invoice No. (company details autofill from it)" value="${esc(d.invoiceNo)}" ${d.isEdit ? '' : 'required'}>
+      ${d.invoiceNote ? `<small style="color:#16a34a;">${esc(d.invoiceNote)}</small>` : ''}
+      <label style="font-size:13px;color:#64748b;">Company</label>
+      <select id="s1Company">
+        <option value="">➕ Create new company manually</option>
+        ${companyList.map(c => `<option value="${esc(c.customer_id)}" ${c.customer_id === d.customerId ? 'selected' : ''}>${esc(c.company_name)}</option>`).join('')}
+      </select>
+      ${picked ? `
+        <div style="background:#f8fafc;border-radius:10px;padding:10px;font-size:13px;color:#475569;">
+          <div>${esc(picked.company_address) || '—'}</div>
+          <div>GST: ${esc(picked.gst_number) || '—'} • ${esc(picked.contractor_person) || ''} ${esc(picked.contractor_number) || ''}</div>
+        </div>` : `
+        ${input('s1CompanyName', 'Company Name', d.companyName)}
+        <textarea id="s1CompanyAddress" placeholder="Company Address" rows="2">${esc(d.companyAddress)}</textarea>
+        ${input('s1Gst', 'GST Number (optional)', d.gstNumber)}
+        ${input('s1ContactPerson', 'Contact Person (optional)', d.contactPerson)}
+        ${input('s1ContactNumber', 'Contact Number (optional)', d.contactNumber)}
+        ${input('s1ContactEmail', 'Contact Email (optional)', d.contactEmail)}`}
+      <div style="display:flex;gap:10px;">
+        <div style="flex:1;display:flex;flex-direction:column;gap:4px;">
+          <label style="font-size:13px;color:#64748b;">Payment</label>
+          <select id="s1Payment">
+            <option value="paid" ${d.paymentMode === 'paid' ? 'selected' : ''}>Paid (full)</option>
+            <option value="partial" ${d.paymentMode === 'partial' ? 'selected' : ''}>Partial (part now, rest later)</option>
+            <option value="credit" ${d.paymentMode === 'credit' ? 'selected' : ''}>Credit (pay later)</option>
+          </select>
+        </div>
+        <div style="flex:1;display:flex;flex-direction:column;gap:4px;">
+          <label style="font-size:13px;color:#64748b;">Price Currency</label>
+          <select id="s1Currency">
+            ${Object.keys(CURRENCIES).map(c => `<option value="${c}" ${c === d.currency ? 'selected' : ''}>${c}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      ${d.paymentMode !== 'paid' ? `
+        <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:6px;">
+          <label style="font-size:13px;color:#9a3412;font-weight:600;">In how many days will the ${d.paymentMode === 'partial' ? 'remaining' : ''} payment be made?</label>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input id="s1CreditDays" type="number" min="1" max="365" step="1" placeholder="Credit time (days)" value="${esc(d.creditDays)}" style="flex:1;">
+            <span style="font-size:12px;color:#9a3412;white-space:nowrap;" id="s1DueHint"></span>
+          </div>
+          ${d.paymentMode === 'partial' ? '<small style="color:#9a3412;">The amount paid now is asked on the next step, once products and prices are added.</small>' : ''}
+        </div>` : ''}
+      ${d.currency !== 'INR' ? `
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span style="font-size:13px;color:#64748b;white-space:nowrap;">1 ${d.currency} = ₹</span>
+          <input id="s1Rate" type="number" step="any" min="0" value="${d.exchangeRate}" style="flex:1;">
+          <button type="button" id="s1RefreshRate" style="padding:8px 12px;border:none;border-radius:8px;background:#e2e8f0;cursor:pointer;">Refresh</button>
+        </div>
+        <small style="color:#94a3b8;">${esc(d.rateNote)}</small>` : ''}
       <label style="font-size:13px;color:#64748b;">Shipment Dispatch Date</label>
-      <input type="date" id="s1DispatchDate" value="${shipmentDraft.dispatchDate}" required>
-      <label style="font-size:13px;color:#64748b;">Shipment Received Date <span style="color:#94a3b8;">(optional — can be added later)</span></label>
-      <input type="date" id="s1ReceivedDate" value="${shipmentDraft.receivedDate}">
+      <input type="date" id="s1Dispatch" value="${esc(d.dispatchDate)}" required>
+      ${d.isEdit ? `<input type="hidden" id="s1ReceivedDate" value="${esc(d.receivedDate)}">` : `<label style="font-size:13px;color:#64748b;">Shipment Received Date <span style="color:#94a3b8;">(optional — can be added later)</span></label>
+      <input type="date" id="s1ReceivedDate" value="${esc(d.receivedDate)}">`}
       <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:10px;">
         <button type="button" class="cancel-btn" id="shipCancelBtn" style="padding:10px 16px;border:none;border-radius:8px;background:#eee;cursor:pointer;">Cancel</button>
         <button type="submit" style="padding:10px 16px;border:none;border-radius:8px;background:#1665ff;color:#fff;cursor:pointer;">Next: Add Products</button>
@@ -438,12 +785,71 @@ function renderStep1() {
   `;
   box.querySelector('.close').addEventListener('click', () => closeModal('shipmentModal'));
   box.querySelector('#shipCancelBtn').addEventListener('click', () => closeModal('shipmentModal'));
+  box.querySelector('#s1Invoice').addEventListener('change', async () => {
+    readStep1();
+    d.invoiceNote = '';
+    if (!d.invoiceNo) return;
+    try {
+      const r = await apiFetch('/invoice/lookup?invoice_no=' + encodeURIComponent(d.invoiceNo));
+      if (!r.ok) return;
+      const f = await r.json();
+      if (!f.found) return;
+      const c = companyList.find(x => (x.company_name || '').trim().toLowerCase() === String(f.company_name).trim().toLowerCase());
+      d.customerId = c ? c.customer_id : '';
+      d.companyName = c ? c.company_name : f.company_name;
+      d.companyAddress = c ? (c.company_address || '') : (f.company_address || '');
+      d.gstNumber = c ? (c.gst_number || '') : '';
+      d.contactPerson = c ? (c.contractor_person || '') : '';
+      d.contactNumber = c ? (c.contractor_number || '') : '';
+      d.contactEmail = c ? (c.contractor_email || '') : '';
+      d.invoiceNote = 'Company autofilled from this invoice: ' + d.companyName;
+      renderStep1();
+    } catch (err) { }
+  });
+  box.querySelector('#s1Company').addEventListener('change', (e) => {
+    readStep1();
+    const c = companyList.find(x => x.customer_id === e.target.value);
+    d.customerId = c ? c.customer_id : '';
+    d.companyName = c ? c.company_name : '';
+    d.companyAddress = c ? (c.company_address || '') : '';
+    d.gstNumber = c ? (c.gst_number || '') : '';
+    d.contactPerson = c ? (c.contractor_person || '') : '';
+    d.contactNumber = c ? (c.contractor_number || '') : '';
+    d.contactEmail = c ? (c.contractor_email || '') : '';
+    renderStep1();
+  });
+  box.querySelector('#s1Payment').addEventListener('change', (e) => {
+    readStep1();
+    d.paymentMode = e.target.value;
+    renderStep1();
+  });
+  const refreshDueHint = () => {
+    const hint = box.querySelector('#s1DueHint');
+    if (!hint) return;
+    const days = Number(box.querySelector('#s1CreditDays').value) || 0;
+    const disp = box.querySelector('#s1Dispatch').value;
+    hint.textContent = days > 0 ? `Due on ${addDays(disp, days)}` : '';
+  };
+  box.querySelector('#s1CreditDays')?.addEventListener('input', refreshDueHint);
+  box.querySelector('#s1Dispatch').addEventListener('change', refreshDueHint);
+  refreshDueHint();
+  box.querySelector('#s1Currency').addEventListener('change', (e) => {
+    readStep1();
+    d.currency = e.target.value;
+    fetchRate();
+  });
+  box.querySelector('#s1RefreshRate')?.addEventListener('click', () => { readStep1(); fetchRate(); });
   box.querySelector('#shipStep1Form').addEventListener('submit', (e) => {
     e.preventDefault();
-    shipmentDraft.companyName = document.getElementById('s1CompanyName').value.trim();
-    shipmentDraft.companyAddress = document.getElementById('s1CompanyAddress').value.trim();
-    shipmentDraft.dispatchDate = document.getElementById('s1DispatchDate').value;
-    shipmentDraft.receivedDate = document.getElementById('s1ReceivedDate').value; // may stay empty
+    readStep1();
+    if (!d.invoiceNo && !d.isEdit) return showResponseModal('Invoice required', 'Enter the invoice number.', false);
+    if (!d.companyName) return showResponseModal('Company required', 'Select a company or enter its name.', false);
+    if (d.currency !== 'INR' && !(d.exchangeRate > 0)) return showResponseModal('Rate required', 'Enter a valid exchange rate.', false);
+    if (d.paymentMode !== 'paid') {
+      const days = Number(d.creditDays);
+      if (!Number.isInteger(days) || days < 1 || days > 365) return showResponseModal('Credit time required', 'Enter in how many days (1-365) the payment will be made.', false);
+      d.creditDays = days;
+    }
     shipmentStep = 2;
     renderShipmentStep();
   });
@@ -454,12 +860,19 @@ function renderStep2() {
   const box = SHIPMENT_MODAL();
   box.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-      <h3>Add Shipment</h3>
+      <h3>${shipmentDraft.isEdit ? 'Edit' : 'Add'} Shipment</h3>
       <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
     </div>
     ${stepDots(2)}
     <p style="font-size:13px;color:#64748b;margin-bottom:10px;">Add every product going out in this shipment.</p>
     <div id="productRows" style="display:flex;flex-direction:column;gap:10px;"></div>
+    <p id="shipTotals" style="margin-top:12px;font-size:13px;font-weight:600;color:#334155;text-align:right;"></p>
+    ${shipmentDraft.paymentMode === 'partial' ? `
+      <div style="margin-top:10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:10px;">
+        <label style="font-size:13px;color:#9a3412;font-weight:600;">Amount paid now (${shipmentDraft.currency})</label>
+        <input id="s2PaidAmount" type="number" min="0" step="any" placeholder="e.g. half of the total" value="${shipmentDraft.paidAmount || ''}" style="width:100%;margin-top:4px;">
+        <p id="s2PaidHint" style="font-size:12px;color:#9a3412;margin-top:6px;"></p>
+      </div>` : ''}
     <button type="button" id="addProductRowBtn" style="margin-top:10px;padding:10px 14px;border:1px dashed #94a3b8;border-radius:8px;background:#f8fafc;cursor:pointer;font-size:13px;color:#334155;">
       <i class="fa-solid fa-plus"></i> Add Product
     </button>
@@ -473,7 +886,7 @@ function renderStep2() {
 
   // seed with one row if nothing added yet
   if (!shipmentDraft.products.length) addProductRow();
-  else shipmentDraft.products.forEach(() => {}); // rows are rebuilt below from state
+  else shipmentDraft.products.forEach(() => { }); // rows are rebuilt below from state
 
   renderProductRows();
 
@@ -482,12 +895,21 @@ function renderStep2() {
     renderProductRows();
   });
 
+  box.querySelector('#s2PaidAmount')?.addEventListener('input', updateShipTotals);
   box.querySelector('#shipNextToPartsBtn').addEventListener('click', () => {
     readProductRowsIntoDraft();
     const valid = shipmentDraft.products.filter(p => p.name && p.quantity);
     if (!valid.length) {
       showResponseModal('Add a product', 'Please add at least one product with a name and quantity.', false);
       return;
+    }
+    if (shipmentDraft.paymentMode === 'partial') {
+      const total = draftTotal({ products: valid });
+      const paid = Number(shipmentDraft.paidAmount) || 0;
+      if (!(paid > 0) || paid >= total) {
+        showResponseModal('Check paid amount', 'For a partial payment, the amount paid now must be more than 0 and less than the total (' + curMoney(total, shipmentDraft.currency) + ').', false);
+        return;
+      }
     }
     shipmentDraft.products = valid.map(p => ({ ...p, warranty: p.warranty || '', parts: p.parts || [] }));
     shipmentStep = 3;
@@ -505,13 +927,15 @@ function renderProductRows() {
     <div style="display:flex;gap:8px;align-items:center;" data-row="${i}">
       <input type="text" class="prodName" placeholder="Product Name" value="${p.name}" style="flex:2;">
       <input type="number" min="0" class="prodQty" placeholder="Qty" value="${p.quantity}" style="flex:1;">
-      <input type="number" min="0" class="prodPrice" placeholder="Price" value="${p.price}" style="flex:1;">
+      <input type="number" min="0" step="any" class="prodPrice" placeholder="Price (${shipmentDraft.currency})" value="${p.price}" style="flex:1;">
       <button type="button" class="removeProdBtn" data-index="${i}" style="border:none;background:#fee2e2;color:#dc2626;border-radius:8px;width:38px;height:38px;cursor:pointer;">
         <i class="fa-solid fa-xmark"></i>
       </button>
     </div>
   `).join('');
 
+  wrap.oninput = updateShipTotals;
+  updateShipTotals();
   wrap.querySelectorAll('.removeProdBtn').forEach(btn => {
     btn.addEventListener('click', () => {
       readProductRowsIntoDraft();
@@ -520,6 +944,26 @@ function renderProductRows() {
       renderProductRows();
     });
   });
+}
+
+function updateShipTotals() {
+  readProductRowsIntoDraft();
+  const el = document.getElementById('shipTotals');
+  if (!el) return;
+  const d = shipmentDraft;
+  const t = draftTotal(d);
+  el.textContent = d.currency === 'INR'
+    ? `Total: ${money(t)}`
+    : `Total: ${curMoney(t, d.currency)} ≈ ${money(Math.round(t * d.exchangeRate * 100) / 100)} (at ₹${d.exchangeRate}/${d.currency})`;
+  const paidInput = document.getElementById('s2PaidAmount');
+  if (paidInput) {
+    d.paidAmount = Number(paidInput.value) || 0;
+    const hint = document.getElementById('s2PaidHint');
+    if (hint) {
+      const left = Math.max(t - d.paidAmount, 0);
+      hint.textContent = `Balance ${curMoney(left, d.currency)} on credit for ${d.creditDays} day(s) — due ${addDays(d.dispatchDate, d.creditDays)}`;
+    }
+  }
 }
 
 function readProductRowsIntoDraft() {
@@ -538,7 +982,7 @@ function renderStep3() {
   const box = SHIPMENT_MODAL();
   box.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-      <h3>Add Shipment</h3>
+      <h3>${shipmentDraft.isEdit ? 'Edit' : 'Add'} Shipment</h3>
       <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
     </div>
     ${stepDots(3)}
@@ -642,6 +1086,28 @@ async function finalizeShipment() {
     p.parts = p.parts.filter(part => part.name);
   });
 
+  if (shipmentDraft.isEdit) {
+    try {
+      const res = await apiFetch(`/shipment/update/${shipmentDraft.id}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ updated_values: toServerShape(shipmentDraft) })
+      });
+      if (!res.ok) throw new Error('update failed');
+    } catch (err) {
+      showResponseModal('Update failed', 'The shipment could not be updated.', false);
+      return;
+    }
+    shipmentDraft.totalInr = Math.round(draftTotal(shipmentDraft) * shipmentDraft.exchangeRate * 100) / 100;
+    const idx = shipments.findIndex(x => x.id === shipmentDraft.id);
+    if (idx !== -1) shipments[idx] = shipmentDraft;
+    closeModal('shipmentModal');
+    shipmentDraft = null;
+    renderCards();
+    renderTable();
+    showResponseModal('Shipment updated', 'The shipment has been updated successfully.', true);
+    return;
+  }
+
   shipmentDraft.createdAt = new Date().toISOString();
 
   try {
@@ -649,9 +1115,16 @@ async function finalizeShipment() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(toServerShape(shipmentDraft))
     });
+    if (res.status === 400 || res.status === 422) {
+      const err = await res.json().catch(() => ({}));
+      showResponseModal('Shipment not saved', typeof err.detail === 'string' ? err.detail : 'Please check the payment details.', false);
+      return;
+    }
     if (res.ok) {
       const data = await res.json();
       if (data.shipment_id) shipmentDraft.id = data.shipment_id;
+      shipmentDraft.customerId = data.customer_id || shipmentDraft.customerId;
+      shipmentDraft.totalInr = Math.round(draftTotal(shipmentDraft) * shipmentDraft.exchangeRate * 100) / 100;
     }
   } catch (err) {
     // no backend route yet — shipment still gets added to local state below
@@ -674,6 +1147,10 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('addShipmentBtn').addEventListener('click', openAddShipmentModal);
   document.getElementById('applyShipmentFilter').addEventListener('click', renderTable);
   document.getElementById('shipmentSearch').addEventListener('input', renderTable);
+  document.querySelector('.top-actions .export')?.addEventListener('click', () => {
+    shipExportCsv(shipTableRows(), 'shipments');
+  });
+  a4Twin(document.querySelector('.top-actions .export'), 'Shipments');
   wireShipmentCardClicks();
   loadShipments();
 });

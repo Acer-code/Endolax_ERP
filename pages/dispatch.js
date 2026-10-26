@@ -1,5 +1,7 @@
 const dispState = { pendingOrders: [], pendingSpare: [], pendingProductAlloc: [], dispatchedOrders: [], dispatchedSpare: [], dispatchedProductAlloc: [], searchQuery: '', activeFilters: null };
 let dispPage = 1;
+let dispAssemblyDates = {};   // serial -> assembling date (from backend)
+let dispUserNames = {};   // username -> display name (for the form's REF box)
 const DISP_PAGE_SIZE = 30;
 
 function renderTablePagination(container, page, totalPages, onChange) {
@@ -24,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
   wireFilter();
   wireHeaderSearch();
   wireDispatchCardClicks();
+  wireDispatchExport();
   setInterval(loadDispatchQueue, 60 * 1000);
 });
 
@@ -35,29 +38,7 @@ function dispatchRowState(d) {
 }
 
 function dispatchCardTypeLabel(kind) {
-  return kind === 'order' ? 'Order' : kind === 'product_allocation' ? 'Product' : 'Spare Part';
-}
-
-function dispatchCardRowsHtml(rows) {
-  if (!rows.length) return '<p style="color:#94a3b8;text-align:center;padding:16px;">No records to show.</p>';
-  return `<table style="width:100%;font-size:13px;border-collapse:collapse;">
-    <thead><tr style="text-align:left;">
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Type</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Date</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Product</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Bill To / Service</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Docket No.</th>
-      <th style="padding:6px 4px;border-bottom:1px solid #eef1f6;">Status</th>
-    </tr></thead>
-    <tbody>${rows.map(row => `<tr>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${dispatchCardTypeLabel(row.kind)}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${dateLabel(row)}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${productLabel(row)}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${billToLabel(row)}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${row.data.dispatch?.docket_no ?? '-'}</td>
-      <td style="padding:6px 4px;border-bottom:1px solid #f5f7fa;">${dispatchRowState(row.data)}</td>
-    </tr>`).join('')}</tbody>
-  </table>`;
+  return kind === 'order' ? 'Order' : kind === 'product_allocation' ? 'Product' : kind === 'service' ? 'Service' : 'Spare Part';
 }
 
 function dispatchCardRows(cardType) {
@@ -67,6 +48,7 @@ function dispatchCardRows(cardType) {
   if (cardType === 'orders_pending') return all.filter(r => r.kind === 'order' && dispatchRowState(r.data) !== 'dispatched');
   if (cardType === 'spare_pending') return all.filter(r => r.kind === 'spare_part' && dispatchRowState(r.data) !== 'dispatched');
   if (cardType === 'product_pending') return all.filter(r => r.kind === 'product_allocation' && dispatchRowState(r.data) !== 'dispatched');
+  if (cardType === 'service_pending') return all.filter(r => r.kind === 'service' && dispatchRowState(r.data) !== 'dispatched');
   if (cardType === 'dispatched_today') return all.filter(r => r.data.dispatch?.dispatched_at && new Date(r.data.dispatch.dispatched_at).toDateString() === today);
   if (cardType === 'total_dispatched') return all.filter(r => !!r.data.dispatch);
   return [];
@@ -77,51 +59,207 @@ const DISPATCH_CARD_TITLES = {
   orders_pending: 'Orders Pending',
   spare_pending: 'Spare Parts Pending',
   product_pending: 'Products Pending',
+  service_pending: 'Services Pending',
   dispatched_today: 'Dispatched Today',
   total_dispatched: 'Total Dispatched'
 };
 
+const dispCV = { type: '', base: [], f: {} };
+const DISP_STATE_LABELS = { pending: 'Pending', in_progress: 'In Progress', dispatched: 'Dispatched' };
+
+function cvEnsureStyles() {
+  if (document.getElementById('cvStyles')) return;
+  const st = document.createElement('style');
+  st.id = 'cvStyles';
+  st.textContent = `
+    .cv-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+    .cv-head h3{margin:0}
+    .cv-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+    .cv-bar select,.cv-bar input{padding:7px 9px;border:1px solid var(--border);border-radius:8px;font-size:12.5px;background:var(--bg-white);min-width:0}
+    .cv-bar input[type=text]{flex:1;min-width:150px}
+    .cv-bar label{font-size:12px;color:var(--text-muted)}
+    .cv-btn{padding:8px 12px;border:none;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600}
+    .cv-btn.exp{background:var(--primary);color:#fff}
+    .cv-btn.rst{background:var(--bg-hover);color:var(--text-secondary)}
+    .cv-count{font-size:12px;color:var(--text-muted);margin:0 0 8px}
+    .cv-wrap{overflow:auto;max-height:58vh;border:1px solid var(--border);border-radius:10px}
+    .cv-tbl{width:100%;font-size:12.5px;border-collapse:collapse;min-width:760px}
+    .cv-tbl th{position:sticky;top:0;background:var(--bg-light);color:var(--text-secondary);text-align:left;padding:8px;border-bottom:1px solid var(--border);white-space:nowrap}
+    .cv-tbl td{color:var(--text-primary);padding:8px;border-bottom:1px solid var(--bg-hover);vertical-align:top}
+    .cv-tbl tbody tr.cv-row{cursor:pointer}
+    .cv-tbl tbody tr.cv-row:hover{background:var(--bg-light)}
+    .cv-hint{font-size:11.5px;color:var(--text-light);margin-top:8px}
+  `;
+  document.head.appendChild(st);
+}
+
+function cvPlain(html) {
+  const d = document.createElement('div');
+  d.innerHTML = String(html ?? '');
+  return d.textContent.replace(/\s+/g, ' ').trim();
+}
+
+function cvDownloadCsv(head, rows, fileBase) {
+  const cell = v => {
+    const t = String(v ?? '');
+    return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+  };
+  const csv = '\ufeff' + [head, ...rows].map(r => r.map(cell).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = `${fileBase}_${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+
+function dispatchStatusHtml(d) {
+  const s = dispatchRowState(d);
+  if (s === 'pending') return '<span class="pending">Pending</span>';
+  if (s === 'dispatched') return d.status === 'delivered' ? '<span class="delivered">Delivered</span>' : '<span class="delivered">Dispatched</span>';
+  return '<span style="background:var(--warning-bg);color:var(--warning-dark);padding:3px 10px;border-radius:999px;font-size:12px;">In Progress</span>';
+}
+
+function dispCvFiltered() {
+  const f = dispCV.f;
+  const q = (f.q || '').toLowerCase();
+  return dispCV.base.filter(row => {
+    const d = row.data;
+    if (f.kind && row.kind !== f.kind) return false;
+    if (f.state && dispatchRowState(d) !== f.state) return false;
+    const day = rowBestDate(d) ? new Date(rowBestDate(d)).toISOString().slice(0, 10) : '';
+    if (f.from && day < f.from) return false;
+    if (f.to && day > f.to) return false;
+    if (q) {
+      const hay = [d.dispatch?.docket_no, d.dispatch?.dispatched_through, d.dispatch?.invoice_no, cvPlain(productLabel(row)), cvPlain(billToLabel(row)),
+      ...rowSerialNumbers(row)].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+const DISP_CV_HEAD = ['Type', 'Date', 'Product', 'Qty', 'Bill To / Service', 'Docket No.', 'Courier / Transport', 'Invoice No.', 'Status'];
+
+function dispCvCells(row) {
+  return [
+    dispatchCardTypeLabel(row.kind),
+    dateLabel(row),
+    productLabel(row),
+    quantityLabel(row),
+    billToLabel(row),
+    row.data.dispatch?.docket_no ?? '-',
+    row.data.dispatch?.dispatched_through || '-',
+    row.data.dispatch?.invoice_no ?? '-',
+    dispatchStatusHtml(row.data)
+  ];
+}
+
+function dispCvExportRows(row) {
+  const d = row.data;
+  const head = [dispatchCardTypeLabel(row.kind), dateLabel(row)];
+  const tail = [cvPlain(billToLabel(row)), d.dispatch?.docket_no ?? '-', d.dispatch?.dispatched_through || '-', d.dispatch?.invoice_no ?? '-', cvPlain(dispatchStatusHtml(d))];
+  if ((row.kind === 'order' || row.kind === 'product_allocation' || row.kind === 'service') && (d.items || []).length) {
+    return d.items.map(i => {
+      const meta = [i.product_id, i.model_no].filter(Boolean).join(' · ');
+      return [...head, `${i.product_name ?? ''}${meta ? ' (' + meta + ')' : ''}`, i.quantity ?? 0, ...tail];
+    });
+  }
+  return [[...head, d.spare_part?.part_name || '', d.spare_part?.quantity ?? '-', ...tail]];
+}
+
+function dispCvPaint() {
+  const body = document.getElementById('cvBody');
+  if (!body) return;
+  const list = dispCvFiltered();
+  body.innerHTML = list.map((row, i) => `<tr class="cv-row" data-i="${i}">${dispCvCells(row).map(c => `<td>${c}</td>`).join('')}</tr>`).join('')
+    || `<tr><td colspan="${DISP_CV_HEAD.length}" style="text-align:center;color:var(--text-light);padding:20px;">Nothing matches these filters.</td></tr>`;
+  document.getElementById('cvCount').textContent = `${list.length} of ${dispCV.base.length} record(s)`;
+  body.querySelectorAll('tr.cv-row').forEach(tr => tr.addEventListener('click', () => {
+    const vm = document.getElementById('viewDispatchModal');
+    if (vm) vm.style.zIndex = 1100;
+    openViewDispatchModal(list[Number(tr.dataset.i)]);
+  }));
+}
+
 function openDispatchCardDetailModal(cardType) {
   const modal = document.getElementById('dispatchCardDetailModal');
   if (!modal) return;
+  cvEnsureStyles();
+  dispCV.type = cardType;
+  dispCV.base = dispatchCardRows(cardType);
+  dispCV.f = {};
+  const fixedKind = { orders_pending: 'order', spare_pending: 'spare_part', product_pending: 'product_allocation', service_pending: 'service' }[cardType];
+
   const content = modal.querySelector('.modal-content');
-  const rows = dispatchCardRows(cardType);
-
-  const categoryFilterHtml = cardType === 'total_pending' ? `
-    <div style="margin-bottom:12px;">
-      <select id="dispatchCardCategoryFilter" style="padding:8px 10px;border:1px solid #e2e8f0;border-radius:8px;">
-        <option value="">All Categories</option>
-        <option value="order">Orders</option>
-        <option value="spare_part">Spare Parts</option>
-        <option value="product_allocation">Allocated Products</option>
-      </select>
-    </div>` : '';
-
+  content.style.width = 'min(1100px,95vw)';
   content.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-      <h3>${DISPATCH_CARD_TITLES[cardType] || ''}</h3>
-      <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
+    <div class="cv-head"><h3>${DISPATCH_CARD_TITLES[cardType] || ''}</h3>
+      <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button></div>
+    <div class="cv-bar">
+      <input type="text" data-f="q" placeholder="Search docket, invoice, product, serial, bill to...">
+      ${fixedKind ? '' : `<select data-f="kind"><option value="">All Categories</option><option value="order">Orders</option><option value="spare_part">Spare Parts</option><option value="product_allocation">Allocated Products</option><option value="service">Services</option></select>`}
+      <select data-f="state"><option value="">All Status</option><option value="pending">Pending</option><option value="in_progress">In Progress</option><option value="dispatched">Dispatched</option></select>
+      <label>Date</label>
+      <input type="date" data-f="from" title="From"><input type="date" data-f="to" title="To">
+      <button class="cv-btn rst" id="cvReset">Reset</button>
+      <button class="cv-btn exp" id="cvExport"><i class="fa-solid fa-download"></i> Export CSV</button>
+      <button class="cv-btn exp" id="cvPrint"><i class="fa-solid fa-print"></i> Print</button>
     </div>
-    ${categoryFilterHtml}
-    <div id="dispatchCardRowsWrap">${dispatchCardRowsHtml(rows)}</div>`;
+    <p class="cv-count" id="cvCount"></p>
+    <div class="cv-wrap"><table class="cv-tbl">
+      <thead><tr>${DISP_CV_HEAD.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+      <tbody id="cvBody"></tbody></table></div>
+    <p class="cv-hint">Click a row to see full details.</p>`;
 
-  const catSelect = content.querySelector('#dispatchCardCategoryFilter');
-  if (catSelect) {
-    catSelect.addEventListener('change', () => {
-      const filtered = catSelect.value ? rows.filter(r => r.kind === catSelect.value) : rows;
-      content.querySelector('#dispatchCardRowsWrap').innerHTML = dispatchCardRowsHtml(filtered);
-    });
-  }
-
-  content.querySelector('.close').addEventListener('click', () => modal.style.display = 'none');
-  modal.addEventListener('click', e => { if (e.target === modal) modal.style.display = 'none'; }, { once: true });
+  content.querySelector('.close').addEventListener('click', () => { modal.style.display = 'none'; });
+  content.querySelectorAll('[data-f]').forEach(el => el.addEventListener(el.type === 'text' ? 'input' : 'change', e => {
+    dispCV.f[el.dataset.f] = e.target.value;
+    dispCvPaint();
+  }));
+  content.querySelector('#cvReset').addEventListener('click', () => {
+    dispCV.f = {};
+    content.querySelectorAll('[data-f]').forEach(el => { el.value = ''; });
+    dispCvPaint();
+  });
+  content.querySelector('#cvExport').addEventListener('click', () => {
+    cvDownloadCsv(DISP_CV_HEAD, dispCvFiltered().flatMap(dispCvExportRows),
+      (DISPATCH_CARD_TITLES[cardType] || 'dispatch').toLowerCase().replace(/[^a-z0-9]+/g, '_'));
+  });
+  content.querySelector('#cvPrint').addEventListener('click', () => {
+    if (typeof A4Print === 'undefined') { alert('print_a4.js is not loaded.'); return; }
+    A4Print.table(dispatchPrintOpts(DISPATCH_CARD_TITLES[cardType] || 'Dispatch', dispCvFiltered()));
+  });
+  dispCvPaint();
   modal.style.display = 'flex';
+}
+
+function dispatchPrintOpts(title, rows) {
+  return {
+    title: title + ' - Dispatch',
+    subtitle: 'Dispatch queue',
+    head: DISP_CV_HEAD,
+    rows: rows.flatMap(dispCvExportRows)
+  };
+}
+
+function wireDispatchExport() {
+  const btn = document.querySelector('.top-actions .export');
+  if (!btn) return;
+  if (typeof A4Print !== 'undefined') A4Print.attachNextTo(btn, () => dispatchPrintOpts('Dispatch', getFilteredRows()));
+  btn.addEventListener('click', () => {
+    const rows = getFilteredRows();
+    if (!rows.length) { alert('Nothing to export for the current filters.'); return; }
+    cvDownloadCsv(DISP_CV_HEAD, rows.flatMap(dispCvExportRows), 'dispatch');
+  });
 }
 
 function wireDispatchCardClicks() {
   document.querySelectorAll('.card-clickable').forEach(card => {
     card.addEventListener('click', () => openDispatchCardDetailModal(card.dataset.card));
   });
+  const modal = document.getElementById('dispatchCardDetailModal');
+  if (modal) modal.addEventListener('mousedown', e => { if (e.target === modal) modal.style.display = 'none'; });
 }
 
 // ---------- Header search (docket, invoice, product, serial number) ----------
@@ -152,9 +290,10 @@ function getFilteredRows() {
       const d = row.data;
       const docket = (d.dispatch?.docket_no || '').toLowerCase();
       const invoice = (d.dispatch?.invoice_no || '').toLowerCase();
+      const courier = (d.dispatch?.dispatched_through || '').toLowerCase();
       const product = productLabel(row).toLowerCase();
       const serials = rowSerialNumbers(row).map(s => (s || '').toLowerCase());
-      return docket.includes(q) || invoice.includes(q) || product.includes(q) ||
+      return docket.includes(q) || invoice.includes(q) || courier.includes(q) || product.includes(q) ||
         serials.some(s => s.includes(q));
     });
   }
@@ -174,7 +313,20 @@ function getFilteredRows() {
   return rows;
 }
 
+async function loadDispatchUsers() {
+  if (Object.keys(dispUserNames).length) return;
+  try {
+    const res = await apiFetch('/account/users');
+    if (res.ok) ((await res.json()).dataset || []).forEach(u => { if (u.username) dispUserNames[u.username] = u.name || u.username; });
+  } catch (e) { /* names are optional - falls back to the username */ }
+}
+
+function odfPersonName(username) {
+  return username ? (dispUserNames[username] || username) : '';
+}
+
 async function loadDispatchQueue() {
+  loadDispatchUsers();
   try {
     const res = await apiFetch('/dispatch/');
     if (!res.ok) throw new Error('failed to fetch dispatch queue');
@@ -185,6 +337,9 @@ async function loadDispatchQueue() {
     dispState.dispatchedOrders = data.dispatched_orders || [];
     dispState.dispatchedSpare = data.dispatched_spare_parts || [];
     dispState.dispatchedProductAlloc = data.dispatched_product_allocations || [];
+    dispState.pendingServices = data.pending_services || [];
+    dispState.dispatchedServices = data.dispatched_services || [];
+    dispAssemblyDates = data.assembly_dates || {};
     dispPage = 1;
     updateCards();
     renderTable(getFilteredRows());
@@ -198,21 +353,22 @@ function combinedRows() {
   const orderRows = [...dispState.pendingOrders, ...dispState.dispatchedOrders].map(o => ({ kind: 'order', data: o }));
   const spareRows = [...dispState.pendingSpare, ...dispState.dispatchedSpare].map(a => ({ kind: 'spare_part', data: a }));
   const productAllocRows = [...dispState.pendingProductAlloc, ...dispState.dispatchedProductAlloc].map(a => ({ kind: 'product_allocation', data: a }));
-  return [...orderRows, ...spareRows, ...productAllocRows];
+  const serviceRows = [...(dispState.pendingServices || []), ...(dispState.dispatchedServices || [])].map(a => ({ kind: 'service', data: a }));
+  return [...orderRows, ...spareRows, ...productAllocRows, ...serviceRows];
 }
 
 function updateCards() {
   const today = new Date().toDateString();
-  const dispatchedToday = [...dispState.dispatchedOrders, ...dispState.dispatchedSpare, ...dispState.dispatchedProductAlloc]
+  const dispatchedToday = [...dispState.dispatchedOrders, ...dispState.dispatchedSpare, ...dispState.dispatchedProductAlloc, ...(dispState.dispatchedServices || [])]
     .filter(x => x.dispatch?.dispatched_at && new Date(x.dispatch.dispatched_at).toDateString() === today).length;
 
-  document.getElementById('cardTotalPending').textContent = dispState.pendingOrders.length + dispState.pendingSpare.length + dispState.pendingProductAlloc.length;
+  document.getElementById('cardTotalPending').textContent = dispState.pendingOrders.length + dispState.pendingSpare.length + dispState.pendingProductAlloc.length + (dispState.pendingServices || []).length;
   document.getElementById('cardOrdersPending').textContent = dispState.pendingOrders.length;
   document.getElementById('cardSparePending').textContent = dispState.pendingSpare.length;
   const productPendingCard = document.getElementById('cardProductAllocPending');
   if (productPendingCard) productPendingCard.textContent = dispState.pendingProductAlloc.length;
   document.getElementById('cardDispatchedToday').textContent = dispatchedToday;
-  document.getElementById('cardTotalDispatched').textContent = dispState.dispatchedOrders.length + dispState.dispatchedSpare.length + dispState.dispatchedProductAlloc.length;
+  document.getElementById('cardTotalDispatched').textContent = dispState.dispatchedOrders.length + dispState.dispatchedSpare.length + dispState.dispatchedProductAlloc.length + (dispState.dispatchedServices || []).length;
 }
 
 function dateLabel(row) {
@@ -221,7 +377,7 @@ function dateLabel(row) {
 }
 
 function productLabel(row) {
-  if (row.kind === 'order' || row.kind === 'product_allocation') {
+  if (row.kind === 'order' || row.kind === 'product_allocation' || row.kind === 'service') {
     return (row.data.items || []).map(i => {
       const meta = [i.product_id, i.model_no].filter(Boolean).join(' · ');
       return `<div style="margin-bottom:4px;">${i.product_name ?? ''}${meta ? `<br><small style="color:#94a3b8;">${meta}</small>` : ''}</div>`;
@@ -231,7 +387,7 @@ function productLabel(row) {
 }
 
 function quantityLabel(row) {
-  if (row.kind === 'order' || row.kind === 'product_allocation') {
+  if (row.kind === 'order' || row.kind === 'product_allocation' || row.kind === 'service') {
     return (row.data.items || []).map(i => `<div style="margin-bottom:4px;">${i.quantity ?? 0}</div>`).join('');
   }
   return row.data.spare_part?.quantity ?? '-';
@@ -245,6 +401,7 @@ function billToLabel(row) {
   if (row.kind === 'product_allocation') {
     return row.data.sales_person?.name || row.data.company_name || '-';
   }
+  if (row.kind === 'service') return row.data.company_name || `Service #${(row.data.service_id || '').slice(0, 8)}`;
   return `Service #${(row.data.spare_part?.service_id || '').slice(0, 8)}`;
 }
 
@@ -275,7 +432,7 @@ function renderTable(rows) {
     const statusHtml = !hasDispatch
       ? `<span class="pending">Pending</span>`
       : hasDocket
-        ? `<span class="delivered">Dispatched</span>`
+        ? `<span class="delivered">${d.status === 'delivered' ? 'Delivered' : 'Dispatched'}</span>`
         : `<span style="background:#fef3c7;color:#b45309;padding:3px 10px;border-radius:999px;font-size:12px;">In Progress</span>`;
     const actionHtml = !hasDispatch
       ? '<button class="confirm-dispatch-btn" style="padding:6px 12px;border:none;border-radius:8px;background:#1665ff;color:#fff;cursor:pointer;">Confirm Dispatch</button>'
@@ -286,7 +443,7 @@ function renderTable(rows) {
     tr.dataset.id = row.kind === 'order' ? d.order_id : d.allocation_id;
     tr.dataset.kind = row.kind;
 
-    const typeLabel = row.kind === 'order' ? 'Order' : row.kind === 'product_allocation' ? 'Product' : 'Spare Part';
+    const typeLabel = dispatchCardTypeLabel(row.kind);
     tr.innerHTML = `
       <td>${typeLabel}</td>
       <td>${dateLabel(row)}</td>
@@ -294,10 +451,13 @@ function renderTable(rows) {
       <td>${quantityLabel(row)}</td>
       <td>${billToLabel(row)}</td>
       <td>${d.dispatch?.docket_no ?? '-'}</td>
+      <td>${d.dispatch?.dispatched_through || '-'}</td>
       <td>${d.dispatch?.invoice_no ?? '-'}</td>
       <td>${statusHtml}</td>
       <td>
         <button class="icon-btn view-dispatch-btn" title="View Details"><i class="fa-solid fa-eye"></i></button>
+        <button class="icon-btn print-form-btn" title="Order Dispatch Form (View / Edit / Print)"><i class="fa-solid fa-print"></i></button>
+        <button class="icon-btn qc-form-btn" title="QC Forms (SOP-07)"><i class="fa-solid fa-clipboard-check"></i></button>
         ${actionHtml}
       </td>`;
     tbody.appendChild(tr);
@@ -309,6 +469,22 @@ function renderTable(rows) {
     const id = tr.dataset.id;
     const row = combinedRows().find(r => (kind === 'order' ? r.data.order_id : r.data.allocation_id) === id && r.kind === kind);
     if (row) openViewDispatchModal(row);
+  }));
+
+  tbody.querySelectorAll('.print-form-btn').forEach(btn => btn.addEventListener('click', e => {
+    const tr = e.target.closest('tr');
+    const kind = tr.dataset.kind;
+    const id = tr.dataset.id;
+    const row = combinedRows().find(r => (kind === 'order' ? r.data.order_id : r.data.allocation_id) === id && r.kind === kind);
+    if (row) openDispatchForm(row);
+  }));
+
+  tbody.querySelectorAll('.qc-form-btn').forEach(btn => btn.addEventListener('click', e => {
+    const tr = e.target.closest('tr');
+    const kind = tr.dataset.kind;
+    const id = tr.dataset.id;
+    const row = combinedRows().find(r => (kind === 'order' ? r.data.order_id : r.data.allocation_id) === id && r.kind === kind);
+    if (row) openQcFormFor(row);
   }));
 
   tbody.querySelectorAll('.confirm-dispatch-btn').forEach(btn => btn.addEventListener('click', e => {
@@ -344,98 +520,336 @@ function wireFilter() {
 }
 
 // ---------- View Details modal ----------
+const DV_LABELS = {
+  dispatched_through: 'Courier / Transport', mode_of_delivery: 'Mode of Delivery', gst_number: 'GST No.', total_mrp: 'Total Amount',
+  company_name: 'Company', company_address: 'Address', phone_number: 'Phone', contact_number: 'Contact No.', serial_numbers: 'Serial No.',
+  model_no: 'Model No.', product_id: 'Product ID', tax_rate: 'Tax Rate (%)', order_id: 'Order ID', allocation_id: 'Allocation ID',
+  service_id: 'Service ID', part_name: 'Part Name', created_by: 'Created By', allocated_by: 'Allocated By'
+};
+function dvEsc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function dvLabel(k) {
+  return DV_LABELS[k] || k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+function dvFmt(k, v) {
+  if (v === true) return 'Yes';
+  if (v === false) return 'No';
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}(T|$)/.test(v)) {
+    const t = new Date(v);
+    if (!isNaN(t)) return v.length > 10 ? t.toLocaleString('en-GB') : t.toLocaleDateString('en-GB');
+  }
+  if (typeof v === 'number' && /(price|amount|mrp|total|discount|charge)/i.test(k) && !/(rate|percent|qty|quantity)/i.test(k)) return '\u20b9' + v;
+  return String(v);
+}
+function dvFlat(obj, prefix, out, skip) {
+  Object.entries(obj || {}).forEach(([k, v]) => {
+    if (skip.includes(k) || v === null || v === undefined || v === '') return;
+    if (typeof v === 'string' && v.startsWith('data:')) return;
+    const label = prefix ? `${prefix} \u2013 ${dvLabel(k)}` : dvLabel(k);
+    if (Array.isArray(v)) {
+      if (!v.length) return;
+      if (v.every(x => x === null || typeof x !== 'object')) out.push([label, v.map(x => dvFmt(k, x)).join(', ')]);
+      else v.forEach((x, i) => dvFlat(x, `${label} ${i + 1}`, out, skip));
+    } else if (typeof v === 'object') {
+      dvFlat(v, label, out, skip);
+    } else {
+      out.push([label, dvFmt(k, v)]);
+    }
+  });
+  return out;
+}
+function dvRow(label, value) {
+  if (value === undefined || value === null || value === '') return '';
+  return `<div class="detail"><small>${dvEsc(label)}</small><p>${dvEsc(value)}</p></div>`;
+}
+function dvRows(obj, skip) {
+  return dvFlat(obj, '', [], ['_id', 'image', 'password'].concat(skip || [])).map(([l, v]) => dvRow(l, v)).join('');
+}
+function dvSection(title, html) {
+  return html ? `<h4 style="margin:16px 0 8px;font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:#64748b;">${title}</h4>${html}` : '';
+}
+function dvItemBlock(it) {
+  return `<div style="border:1px solid #e2e8f0;border-radius:10px;padding:8px 12px;margin-bottom:8px;">${dvRows(it)}</div>`;
+}
+
+function dvPick(obj, keys) {
+  for (const k of keys) {
+    const v = obj ? obj[k] : undefined;
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return '';
+}
+function dvTile(label, value, hl) {
+  if (value === undefined || value === null || value === '') return '';
+  return `<div style="background:${hl ? '#eef4ff' : '#f7f8fd'};${hl ? 'border:1px solid #bfd4ff;' : ''}border-radius:12px;padding:12px 14px;min-width:0;">
+    <div style="font-size:12px;color:#64748b;margin-bottom:4px;">${dvEsc(label)}</div>
+    <div style="font-size:14.5px;color:#1e293b;font-weight:500;word-break:break-word;">${dvEsc(value)}</div></div>`;
+}
+function dvTileGrid(tilesHtml) {
+  return tilesHtml ? `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;">${tilesHtml}</div>` : '';
+}
+function dvLeftoverTiles(obj, skip, prefix) {
+  return dvFlat(obj, prefix || '', [], ['_id', 'image', 'password'].concat(skip || [])).map(([l, v]) => dvTile(l, v)).join('');
+}
+function dvChips(arr) {
+  return (arr || []).map(x => `<span style="display:inline-block;background:#eef2ff;color:#3730a3;border-radius:8px;padding:2px 8px;font-size:12px;margin:2px 4px 2px 0;">${dvEsc(x)}</span>`).join('');
+}
+function dvTitle(t) {
+  return `<h4 style="margin:18px 0 8px;font-size:13px;color:#334155;">${t}</h4>`;
+}
+function dvProductsTable(items, withPrice) {
+  if (!items.length) return '';
+  const th = 'padding:12px 14px;text-align:left;color:#334155;white-space:nowrap;';
+  const td = 'padding:12px 14px;border-top:1px solid #eef1f6;vertical-align:top;';
+  const rows = items.map(it => {
+    const qty = Number(it.quantity) || 0;
+    const price = Number(it.price);
+    const tax = Number(it.tax_rate) || 0;
+    const line = !isNaN(price) && it.price !== undefined && it.price !== '' ? qty * price * (1 + tax / 100) : null;
+    return `<tr>
+      <td style="${td}"><strong>${dvEsc(it.product_name ?? '')}</strong><br><small style="color:#94a3b8;">${dvEsc([it.product_id && 'ID: ' + it.product_id, it.model_no && 'Model: ' + it.model_no].filter(Boolean).join(' \u00b7 '))}</small></td>
+      <td style="${td}">${dvChips(it.serial_numbers) || '-'}</td>
+      <td style="${td}">${qty}</td>
+      ${withPrice ? `<td style="${td}">${it.price !== undefined && it.price !== '' ? '\u20b9' + Number(it.price).toLocaleString('en-IN') : '-'}</td>
+      <td style="${td}">${it.tax_rate !== undefined && it.tax_rate !== '' ? it.tax_rate + '%' : '-'}</td>
+      <td style="${td}"><strong>${line === null ? '-' : '\u20b9' + line.toLocaleString('en-IN')}</strong></td>` : ''}
+    </tr>`;
+  }).join('');
+  return `<div style="border:1px solid #e2e8f0;border-radius:12px;overflow-x:auto;">
+    <table style="width:100%;min-width:480px;border-collapse:collapse;font-size:13.5px;">
+      <thead><tr style="background:#eaf2ff;"><th style="${th}">Product</th><th style="${th}">Serial No(s)</th><th style="${th}">Qty</th>${withPrice ? `<th style="${th}">Price</th><th style="${th}">Tax</th><th style="${th}">Line Total</th>` : ''}</tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+}
+function dvTotalsBox(d) {
+  const items = d.items || [];
+  let sub = 0, tax = 0;
+  items.forEach(it => {
+    const base = (Number(it.quantity) || 0) * (Number(it.price) || 0);
+    sub += base;
+    tax += base * (Number(it.tax_rate) || 0) / 100;
+  });
+  const disc = Number(d.discount) || 0;
+  const total = d.total_mrp !== undefined && d.total_mrp !== '' ? Number(d.total_mrp) : sub + tax - disc;
+  const money = n => '\u20b9' + Number(n || 0).toLocaleString('en-IN');
+  const line = (k, v, strong) => `<div style="display:flex;justify-content:space-between;padding:6px 0;${strong ? 'border-top:1px solid #e2e8f0;margin-top:6px;padding-top:12px;font-weight:700;font-size:15px;' : ''}"><span>${k}</span><span>${v}</span></div>`;
+  return `<div style="background:#f7f8fd;border-radius:12px;padding:12px 18px;width:min(360px,100%);margin:14px 0 0 auto;font-size:14px;">
+    ${line('Subtotal', money(sub))}${line('Tax', money(tax))}${line('Discount', '- ' + money(disc))}${line('Total Amount', money(total), true)}</div>`;
+}
+
 function openViewDispatchModal(row) {
   const modal = document.getElementById('viewDispatchModal');
   if (!modal) return;
   const content = modal.querySelector('.modal-content');
   const d = row.data;
   const disp = d.dispatch || null;
+  const c = d.customer || {};
+  const idLabel = row.kind === 'order' ? 'Order ID' : row.kind === 'service' ? 'Service ID' : 'Allocation ID';
+  const idValue = row.kind === 'order' ? d.order_id : d.allocation_id;
 
-  let bodyHtml = '';
+  let infoTiles = '';
+  let productsHtml = '';
+  let totalsHtml = '';
   if (row.kind === 'order') {
-    const items = d.items || [];
-    const customer = d.customer || {};
-    const itemsRows = items.length
-      ? items.map(it => `<tr>
-          <td>${it.product_name ?? ''}<br><small style="color:#94a3b8;">${[it.product_id, it.model_no].filter(Boolean).join(' · ')}</small>${it.serial_numbers?.length ? `<br><small style="color:#94a3b8;">${it.serial_numbers.join(', ')}</small>` : ''}</td>
-          <td>${it.quantity ?? 0}</td>
-          <td>₹${it.price ?? 0}</td>
-        </tr>`).join('')
-      : `<tr><td colspan="3" style="text-align:center;color:#94a3b8;">No items</td></tr>`;
-
-    bodyHtml = `
-      <div class="detail"><small>Order ID</small><p>${d.order_id ?? ''}</p></div>
-      <div class="detail"><small>Order Date</small><p>${d.order_date ? new Date(d.order_date).toLocaleDateString('en-GB') : '-'}</p></div>
-      <div class="detail"><small>Company</small><p>${customer.company_name ?? '-'}</p></div>
-      <div class="detail"><small>Status</small><p>${d.status ?? ''}</p></div>
-      <table style="width:100%;font-size:13px;margin:10px 0;border-collapse:collapse;">
-        <thead><tr style="text-align:left;color:#fff;"><th>Product</th><th>Qty</th><th>Price</th></tr></thead>
-        <tbody>${itemsRows}</tbody>
-      </table>
-      <div class="detail"><small>Total Amount</small><p>₹${d.total_mrp ?? 0}</p></div>`;
+    const usedTop = ['dispatch', 'items', 'customer', 'attachments', 'order_id', 'status', 'total_mrp', 'discount', 'order_date', 'payment_mode', 'credit_days', 'payment_terms', 'reference', 'reference_name', 'created_by', 'warranty', 'warranty_period'];
+    const usedCust = ['company_name', 'gst_number', 'gst_no', 'gstin', 'phone_number', 'contact_number', 'contact', 'phone', 'mobile', 'contact_person'];
+    const pay = [dvPick(d, ['payment_mode', 'payment_terms']), d.credit_days ? `${d.credit_days} days` : ''].filter(Boolean).join(' \u2014 ');
+    const files = (d.attachments || []).map(a => (typeof a === 'string' ? a : a.filename || a.name || a.original_name || 'file')).join(', ');
+    infoTiles = dvTileGrid(
+      dvTile('Company', c.company_name)
+      + dvTile('GST Number', dvPick(c, ['gst_number', 'gst_no', 'gstin']))
+      + dvTile('Contact', [dvPick(c, ['contact_person']), dvPick(c, ['phone_number', 'contact_number', 'contact', 'phone', 'mobile'])].filter(Boolean).join(' \u00b7 '))
+      + dvTile('Order Date', d.order_date ? new Date(d.order_date).toLocaleDateString('en-GB') : '')
+      + dvTile('Payment', pay)
+      + dvTile('Reference', dvPick(d, ['reference', 'reference_name']))
+      + dvTile('Created By', d.created_by)
+      + dvTile('Warranty', dvPick(d, ['warranty', 'warranty_period']))
+      + dvTile('Attachments', files)
+      + dvLeftoverTiles(c, usedCust, 'Customer')
+      + dvLeftoverTiles(d, usedTop));
+    productsHtml = dvTitle('Products') + dvProductsTable(d.items || [], true);
+    totalsHtml = dvTotalsBox(d);
+  } else if (row.kind === 'service') {
+    infoTiles = dvTileGrid(
+      dvTile('Company', d.company_name)
+      + dvTile('Issue', d.issue)
+      + dvTile('Purchase Date', d.purchase_date)
+      + dvTile('Service Charges', d.service_charges)
+      + dvTile('Approved By', d.approved_by)
+      + dvTile('Approved At', d.approved_at ? new Date(d.approved_at).toLocaleDateString('en-GB') : ''));
+    productsHtml = dvTitle('Products') + dvProductsTable(d.items || [], false);
   } else if (row.kind === 'product_allocation') {
-    const items = d.items || [];
-    const itemsRows = items.length
-      ? items.map(it => `<tr>
-          <td>${it.product_name ?? ''}<br><small style="color:#94a3b8;">${[it.product_id, it.model_no].filter(Boolean).join(' · ')}</small>${it.serial_numbers?.length ? `<br><small style="color:#94a3b8;">${it.serial_numbers.join(', ')}</small>` : ''}</td>
-          <td>${it.quantity ?? 0}</td>
-        </tr>`).join('')
-      : `<tr><td colspan="2" style="text-align:center;color:#94a3b8;">No items</td></tr>`;
-
-    bodyHtml = `
-      <div class="detail"><small>Allocation ID</small><p>${d.allocation_id ?? ''}</p></div>
-      <div class="detail"><small>Sales Person</small><p>${d.sales_person?.name ?? '-'}</p></div>
-      <div class="detail"><small>Address</small><p>${d.address ?? '-'}</p></div>
-      <table style="width:100%;font-size:13px;margin:10px 0;border-collapse:collapse;">
-        <thead><tr style="text-align:left;color:#fff;"><th>Product</th><th>Qty</th></tr></thead>
-        <tbody>${itemsRows}</tbody>
-      </table>`;
+    const usedTop = ['dispatch', 'items', 'sales_person', 'allocation_id', 'company_name', 'address', 'gst_number', 'phone_number', 'allotment_date', 'return_due_date', 'created_by', 'allocated_by', 'remarks', 'status'];
+    infoTiles = dvTileGrid(
+      dvTile('Sales Person', [d.sales_person?.name, d.sales_person?.contact_number].filter(Boolean).join(' \u00b7 '))
+      + dvTile('Company', d.company_name)
+      + dvTile('Address', d.address)
+      + dvTile('GST Number', d.gst_number)
+      + dvTile('Phone', d.phone_number)
+      + dvTile('Allotment Date', d.allotment_date ? new Date(d.allotment_date).toLocaleDateString('en-GB') : '')
+      + dvTile('Return Due', d.return_due_date ? new Date(d.return_due_date).toLocaleDateString('en-GB') : '')
+      + dvTile('Created By', dvPick(d, ['created_by', 'allocated_by']))
+      + dvTile('Remarks', d.remarks)
+      + dvLeftoverTiles(d.sales_person, ['name', 'contact_number'], 'Sales Person')
+      + dvLeftoverTiles(d, usedTop));
+    productsHtml = dvTitle('Products') + dvProductsTable(d.items || [], false);
   } else {
-    bodyHtml = `
-      <div class="detail"><small>Allocation ID</small><p>${d.allocation_id ?? ''}</p></div>
-      <div class="detail"><small>Part Name</small><p>${d.spare_part?.part_name ?? '-'}</p></div>
-      <div class="detail"><small>Quantity</small><p>${d.spare_part?.quantity ?? '-'}</p></div>
-      <div class="detail"><small>Service ID</small><p>${d.spare_part?.service_id ?? '-'}</p></div>`;
+    const usedTop = ['dispatch', 'spare_part', 'allocation_id', 'status'];
+    infoTiles = dvTileGrid(
+      dvTile('Part Name', d.spare_part?.part_name)
+      + dvTile('Quantity', d.spare_part?.quantity)
+      + dvTile('Service ID', d.spare_part?.service_id)
+      + dvLeftoverTiles(d.spare_part, ['part_name', 'quantity', 'service_id'], 'Spare Part')
+      + dvLeftoverTiles(d, usedTop));
   }
 
-  const dispatchHtml = disp ? `
-    <div class="detail"><small>Invoice No.</small><p>${disp.invoice_no ?? '-'}</p></div>
-    <div class="detail"><small>Invoice Date</small><p>${disp.invoice_date ? new Date(disp.invoice_date).toLocaleDateString('en-GB') : '-'}</p></div>
-    <div class="detail"><small>Mode of Delivery</small><p>${disp.mode_of_delivery ?? '-'}</p></div>
-    <div class="detail"><small>Dispatched By</small><p>${disp.dispatched_by ?? '-'}</p></div>
-    <div class="detail"><small>Ship To</small><p>${disp.ship_to_different ? `${disp.ship_to_address?.company_name ?? ''}, ${disp.ship_to_address?.address ?? ''}` : 'Same as bill to'}</p></div>
-    <div class="detail"><small>Dispatched At</small><p>${disp.dispatched_at ? new Date(disp.dispatched_at).toLocaleString('en-GB') : '-'}</p></div>
-  ` : `<div class="detail"><small>Dispatch</small><p>Not yet dispatched</p></div>`;
+  let dispatchHtml;
+  if (disp) {
+    const handled = ['image', 'image_drive_link', 'media_updated_at', 'docket_no', 'dispatched_through', 'mode_of_delivery', 'invoice_no', 'invoice_date', 'dispatched_by', 'ship_to_different', 'ship_to_address', 'dispatched_at'];
+    const ship = disp.ship_to_different
+      ? [disp.ship_to_address?.company_name, disp.ship_to_address?.address].filter(Boolean).join(', ')
+      : 'Same as bill to';
+    const photo = typeof disp.image === 'string' && disp.image.startsWith('data:image')
+      ? `<div style="margin-top:10px;"><div style="font-size:12px;color:#64748b;margin-bottom:6px;">Packaging / Handover Photo</div><img src="${disp.image}" alt="Dispatch photo" style="max-width:100%;border-radius:12px;"></div>`
+      : disp.image_drive_link
+        ? `<div style="margin-top:10px;"><a href="${dvEsc(disp.image_drive_link)}" target="_blank" rel="noopener">View packaging / handover photo</a></div>`
+        : '';
+    dispatchHtml = dvTitle('Dispatch') + dvTileGrid(
+      dvTile('Courier / Transport', disp.dispatched_through || '-', true)
+      + dvTile('Docket No.', disp.docket_no || '-')
+      + dvTile('Mode of Delivery', (disp.mode_of_delivery || '').replace(/_/g, ' '))
+      + dvTile('Invoice No.', disp.invoice_no)
+      + dvTile('Invoice Date', disp.invoice_date ? new Date(disp.invoice_date).toLocaleDateString('en-GB') : '')
+      + dvTile('Dispatched By', disp.dispatched_by)
+      + dvTile('Ship To', ship)
+      + dvTile('Dispatched At', disp.dispatched_at ? new Date(disp.dispatched_at).toLocaleString('en-GB') : '')
+      + dvLeftoverTiles(disp, handled)) + photo;
+  } else {
+    dispatchHtml = dvTitle('Dispatch') + dvTileGrid(dvTile('Dispatch', 'Not yet dispatched'));
+  }
 
+  content.style.width = 'min(980px, 96vw)';
+  content.style.maxHeight = '88vh';
+  content.style.overflowY = 'auto';
   content.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;">
-      <h3>Dispatch Details</h3>
-      <div style="display:flex;align-items:flex-start;gap:16px;">
-        <div style="text-align:right;">
-          <small style="color:#64748b;">Docket No.</small>
-          <p style="margin:2px 0 0;font-weight:600;">${disp?.docket_no ?? '-'}</p>
-        </div>
-        <div style="text-align:right;">
-          <small style="color:#64748b;">By</small>
-          <p style="margin:2px 0 0;font-weight:600;">${disp?.dispatched_through ?? '-'}</p>
-        </div>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid #eef1f6;">
+      <div>
+        <h3 style="margin:0;">Dispatch Details</h3>
+        <div style="font-size:12.5px;color:#94a3b8;margin-top:4px;word-break:break-all;">${idLabel}: ${dvEsc(idValue ?? '')}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <span style="font-size:14px;color:#475569;">${cvPlain(dispatchStatusHtml(d))}</span>
+        <button class="cv-btn exp" id="viewPrintForm" title="Order Dispatch Form"><i class="fa-solid fa-print"></i> Dispatch Form</button>
+        <button class="cv-btn exp" id="viewQcForm" title="QC Forms (SOP-07)"><i class="fa-solid fa-clipboard-check"></i> QC Form</button>
         <button class="close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
       </div>
     </div>
-    ${bodyHtml}
-    <hr style="margin:14px 0;border:none;border-top:1px solid #eef1f6;">
-    ${dispatchHtml}`;
+    ${infoTiles}
+    ${dispatchHtml}
+    ${productsHtml}
+    ${totalsHtml}`;
 
   content.querySelector('.close').addEventListener('click', () => modal.style.display = 'none');
+  content.querySelector('#viewPrintForm').addEventListener('click', () => openDispatchForm(row));
+  content.querySelector('#viewQcForm').addEventListener('click', () => openQcFormFor(row));
   modal.style.display = 'flex';
 }
+
+// ---------- Order Dispatch Form (Excel form -> editable A4 print) ----------
+// Fills only what the system already has; every other box is left blank and
+// stays editable inside the form before printing.
+function odfDateTime(v) {
+  if (!v) return '';
+  const dt = new Date(v);
+  if (isNaN(dt)) return '';
+  const day = dt.toLocaleDateString('en-GB');
+  const hasTime = typeof v === 'string' && v.includes('T') && !/T00:00:00(\.0+)?(Z|[+-]00:?00)?$/.test(v);
+  return hasTime ? `${day} ${dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}` : day;
+}
+
+function odfDefaults(row) {
+  const d = row.data, disp = d.dispatch || {};
+  let company = '', address = '', ref = '', lines = [], serials = [], mfg = [];
+
+  if (row.kind === 'order' || row.kind === 'product_allocation' || row.kind === 'service') {
+    const items = d.items || [];
+    lines = items.map((it, i) => `${i + 1}. ${it.product_name ?? ''}${it.model_no ? ' (' + it.model_no + ')' : ''}  -  Qty: ${it.quantity ?? 0}`);
+    serials = items.filter(it => (it.serial_numbers || []).length).map(it => `${it.product_name ?? ''}: ${it.serial_numbers.join(', ')}`);
+    // Manufacturing date = assembling date of the unit (only filled when an assembly record exists)
+    items.forEach(it => {
+      const days = [...new Set((it.serial_numbers || []).map(sn => dispAssemblyDates[sn]).filter(Boolean)
+        .map(v => new Date(v)).filter(x => !isNaN(x)).map(x => x.toLocaleDateString('en-GB')))];
+      if (days.length) mfg.push(`${it.product_name ?? ''}: ${days.join(', ')}`);
+    });
+  }
+  if (row.kind === 'order') {
+    const c = d.customer || {};
+    company = c.company_name || '';
+    address = c.company_address || '';
+    ref = odfPersonName(d.reference || d.creator?.raised_by);
+  } else if (row.kind === 'service') {
+    company = d.company_name || '';
+    ref = odfPersonName(d.approved_by);
+    lines.unshift('SERVICED PRODUCT RETURN');
+  } else if (row.kind === 'product_allocation') {
+    company = d.sales_person?.name || d.company_name || '';
+    address = d.address || '';
+    ref = d.sales_person?.name || '';
+    lines.unshift('ALLOCATED / DEMO PRODUCT');
+  } else {
+    company = `Service #${(d.spare_part?.service_id || '').slice(0, 8)} (Spare Part)`;
+    ref = odfPersonName(d.allocated_by);
+    lines = ['SPARE PART FOR SERVICE', `1. ${d.spare_part?.part_name ?? ''}  -  Qty: ${d.spare_part?.quantity ?? '-'}`];
+  }
+
+  const extra = [];
+  if (disp.invoice_date) extra.push(`Invoice Date: ${new Date(disp.invoice_date).toLocaleDateString('en-GB')}`);
+  if (disp.docket_no) extra.push(`Docket No.: ${String(disp.docket_no).toUpperCase()}`);
+  if (disp.ship_to_different) extra.push(`SHIP TO: ${disp.ship_to_address?.company_name ?? ''}${disp.ship_to_address?.address ? ', ' + disp.ship_to_address.address : ''}`);
+
+  // mode of dispatch -> tick the matching box of the form
+  const mode = disp.mode_of_delivery || '';
+  const through = disp.dispatched_through || '';
+  const out = { hand: '', porter: '', courier: '', others: '' };
+  if (mode === 'self_pickup') out.hand = '\u2714';
+  else if (mode === 'courier') out.courier = ['\u2714', through].filter(Boolean).join(' ');
+  else if (mode) out.others = [mode.charAt(0).toUpperCase() + mode.slice(1), through].filter(Boolean).join(' - ');
+
+  return {
+    inv: disp.invoice_no ? String(disp.invoice_no).toUpperCase() : '',
+    ref,
+    date: new Date().toLocaleDateString('en-GB'),
+    party: company,
+    address,
+    details: [...lines, ...(extra.length ? ['', ...extra] : [])].join('\n'),
+    ...out,
+    recv: row.kind === 'order' ? odfDateTime(d.order_date) : odfDateTime(d.allotment_date || d.created_at),
+    serials: serials.join('\n'),
+    mfg: mfg.join('\n'),
+    handover: disp.docket_no ? `Docket No.: ${String(disp.docket_no).toUpperCase()}` : ''
+  };
+}
+
+function openQcFormFor(row) {
+  if (typeof openQcForms !== 'function') { alert('qc_forms.js is not loaded.'); return; }
+  openQcForms(row, { assemblyDates: dispAssemblyDates, personName: odfPersonName });
+}
+
+function openDispatchForm(row) {
+  if (typeof A4Print === 'undefined') { alert('print_a4.js is not loaded.'); return; }
+  const d = row.data;
+  A4Print.form(`${row.kind}:${d.order_id || d.allocation_id}`, odfDefaults(row));
+}
+
 function openDispatchModal(row) {
   const modal = document.getElementById('dispatchModal');
   const content = modal.querySelector('.modal-content');
   const existing = row.data.dispatch || null;
   const billTo = row.kind === 'order'
     ? `${row.data.customer?.company_name || ''}${row.data.customer?.company_address ? ', ' + row.data.customer.company_address : ''}`
-    : row.kind === 'product_allocation'
+    : row.kind === 'service'
+      ? row.data.company_name || ''
+      : row.kind === 'product_allocation'
       ? `${row.data.sales_person?.name || ''}${row.data.address ? ', ' + row.data.address : ''}`
       : `Service #${(row.data.spare_part?.service_id || '').slice(0, 8)} (technician location)`;
 
@@ -521,7 +935,9 @@ function openDispatchModal(row) {
 
     const endpoint = row.kind === 'order'
       ? `/dispatch/confirm/order/${row.data.order_id}`
-      : `/dispatch/confirm/spare_part/${row.data.allocation_id}`;
+      : row.kind === 'service'
+        ? `/dispatch/confirm/service/${row.data.service_id}`
+        : `/dispatch/confirm/spare_part/${row.data.allocation_id}`;
 
     const sendConfirmation = async (payload) => {
       try {

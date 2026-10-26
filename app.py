@@ -4,21 +4,22 @@ from pydantic import BaseModel
 from typing import Optional, List
 from bson import ObjectId
 from logger import logging
+import urllib.parse
 from configuration import load_params
 from dotenv import load_dotenv
 from mongodb.mongodb_connection import mongodbclient
 from user.company import login
 from order.manage_order import order_manager
-from service.service_details import service_detail, GDRIVE_PLACEHOLDER
+from service.service_details import service_detail, GDRIVE_PLACEHOLDER, ServiceFlowError, SERVICE_LIST_PROJECTION
 from gdrive_media import upload_base64_to_drive
 from inventory.inventory_handling import inventory_manager
 from user.customer_details import customer_manager
 from sales.sales_person_manager import sales_person_manager
 from allocation.allocation import allocation_manager
 from request.request_manager import request_manager
-from shipment.manage_shipment import shipment_manager
+from shipment.manage_shipment import shipment_manager, compute_payment
 from assembly.manage_assembly import assembly_manager
-from auth import create_access_token, get_current_user, require_role
+from auth import create_access_token, get_current_user, require_role, invalidate_access_cache, _borrowed_roles
 from fastapi.responses import FileResponse,RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import os
@@ -31,6 +32,9 @@ from datetime import datetime, timezone, timedelta
 import io
 import time
 import threading
+import contextlib
+import hashlib
+import json
 from html.parser import HTMLParser
 try:
     from twilio.rest import Client as TwilioClient  
@@ -96,12 +100,14 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ACCOUNTS_COLLECTION = params["account_creation_collection_name"]
+NOTIFICATIONS_COLLECTION = params.get("notification_collection_name", "notifications")
 ORDERS_COLLECTION = params["order_collection_name"]
 SERVICE_COLLECTION = params["service_collection_name"]
 INVENTORY_COLLECTION = params["inventory_collection_name"]
 CUSTOMER_COLLECTION = params.get("customer_collection_name", "customers")
 SALESPERSON_COLLECTION = params.get("salesperson_collection_name", "sales_persons")
 ALLOCATION_COLLECTION = params.get("allocation_collection_name", "allocations")
+INSTALLATION_COLLECTION = params.get("installation_collection_name", "installations")
 REQUESTS_COLLECTION = params.get("requests_collection_name", "requests")
 SHIPMENT_COLLECTION = params.get("shipment_collection_name", "shipments")
 ASSEMBLY_COLLECTION = params.get("assembly_collection_name", "assemblies")
@@ -121,7 +127,6 @@ GMAIL_NOTIFY_RECEIVER = os.getenv("GMAIL_NOTIFY_RECEIVER", GMAIL_SENDER_EMAIL)
 class LoginRequest(BaseModel):
     username: str
     password: str
-    role: str
 
 
 class CreateAccountRequest(BaseModel):
@@ -144,6 +149,9 @@ class UpdateAccountRequest(BaseModel):
 
 class ServiceRequest(BaseModel):
     product_id: str
+    company_name: str = ""
+    product_name: str = ""
+    model_no: str = ""
     serial_no: str
     technician_id: str
     purchase_date: str
@@ -152,6 +160,7 @@ class ServiceRequest(BaseModel):
     video: str
     location: str = "indoor"
     spare_parts: str = ""
+    address: str = ""
 
 
 class OrderItem(BaseModel):
@@ -178,6 +187,7 @@ class CreateOrderRequest(BaseModel):
     discount: float = 0
     warranty_years: int = 1        # standard warranty is 1 year; > 1 means extended
     warranty_charge: float = 0     # additional charge for the extended warranty (0 for standard)
+    reference: str = ""            # username of the reference person; required by /order/create_order/
 
 
 class CustomerRequest(BaseModel):
@@ -192,6 +202,12 @@ class CustomerRequest(BaseModel):
 
 class CustomerUpdateRequest(BaseModel):
     updated_values: dict
+
+
+class CustomerReturnRequest(BaseModel):
+    amount: float
+    note: str = ""
+    return_date: str = ""
 
 
 class SalesPersonRequest(BaseModel):
@@ -214,6 +230,16 @@ class SparePartAllocation(BaseModel):
     service_id: str
     part_name: str
     quantity: int = 1
+    # optional: which inventory item was picked. With hologram_numbers those exact units are
+    # deducted; with only lot_id the given quantity is deducted from that lot.
+    product_id: str = ""
+    model_no: str = ""
+    product_type: str = ""
+    lot_id: str = ""
+    hologram_numbers: list[str] = []
+    holograms: list[dict] = []
+    request_id: str = ""  # spare_part request this allocation fulfils
+    manual_holograms: list[str] = []  # hologram numbers typed for stock that has none on file
 
 
 class CreateAllocationRequest(BaseModel):
@@ -245,6 +271,7 @@ class DispatchConfirmRequest(BaseModel):
     invoice_no: str
     invoice_date: str
     mode_of_delivery: Optional[str] = None
+    dispatched_through: Optional[str] = None
     ship_to_different: bool = False
     ship_to_address: Optional[dict]= None   # {company_name, address} — only used when ship_to_different is True
     image: Optional[str] = None   # optional base64 data URI, e.g. packaging/handover photo
@@ -284,6 +311,100 @@ class ExtendWarrantyRequest(BaseModel):
     warranty_until: str
 
 
+# ---- technician service workflow ----
+class ServiceStartRequest(BaseModel):
+    damage_image: str
+    serial_no: str
+
+
+class FaultyPartIn(BaseModel):
+    part_name: str
+    old_hologram_number: str
+    image: str
+
+
+class SpareDecisionRequest(BaseModel):
+    spare_needed: bool
+    parts: List[FaultyPartIn] = []
+
+
+class NewHologramIn(BaseModel):
+    old_hologram_number: str
+    new_hologram_number: str
+
+
+class ServiceReportRequest(BaseModel):
+    work_done: str
+    parts: List[NewHologramIn] = []
+    final_image: Optional[str] = None
+
+
+class ServiceApproveRequest(BaseModel):
+    service_charges: Optional[float] = None
+
+
+class ServiceSendBackRequest(BaseModel):
+    reason: str
+
+
+class ServiceEditRequest(BaseModel):
+    # every field optional: only the fields the admin actually changed are sent
+    company_name: Optional[str] = None
+    product_name: Optional[str] = None
+    model_no: Optional[str] = None
+    serial_no: Optional[str] = None
+    technician_alloted: Optional[str] = None
+    purchase_date: Optional[str] = None
+    issue: Optional[str] = None
+    location: Optional[str] = None
+    address: Optional[str] = None
+    spare_parts: Optional[str] = None
+    service_charges: Optional[float] = None
+
+
+class ServiceRescheduleRequest(BaseModel):
+    scheduled_date: str
+    reason: str = ""
+
+
+class InstallationCreateRequest(BaseModel):
+    product_name: str
+    model_no: str = ""
+    serial_no: str = ""
+    company_name: str
+    address: str = ""
+    contact_person: str = ""
+    contact_number: str = ""
+    technician_id: str = ""
+    preferred_date: str = ""
+    notes: str = ""
+
+
+class InstallationAssignRequest(BaseModel):
+    technician_id: str
+
+
+class AssignDemoRequest(BaseModel):
+    technician_id: str
+    items: list[AllocationItem]
+    remarks: str = ""
+
+
+class ReassignDemoRequest(BaseModel):
+    technician_id: str
+
+
+class InstallationScheduleRequest(BaseModel):
+    scheduled_date: str
+    note: str = ""
+
+
+class InstallationStatusRequest(BaseModel):
+    status: str
+    note: str = ""
+    image: Optional[str] = None
+
+
 class OrderUpdatedValue(BaseModel):
     updated_order_value: dict
 
@@ -299,6 +420,7 @@ class InventoryRequest(BaseModel):
     tax_rate: int
     model_no: str = ""
     supplier_address: str = ""
+    invoice_no: str = ""
     serial_numbers: list[str] = []
     product_type: str = "product"  # "product" | "spare_parts" | "service_parts" | "damaged" | "accessories"
     parent_product_name: str = ""     # spare_parts / service_parts: which product the part belongs to
@@ -306,6 +428,14 @@ class InventoryRequest(BaseModel):
     warranty_until: str = ""          # YYYY-MM-DD, parts + damaged
     reason: str = ""                  # damaged: reason of damage
     hologram_numbers: list[str] = []  # spare_parts / service_parts, optional, one per unit
+    # supplier ledger: "paid" | "credit" | "" (blank = nothing recorded on the customer ledger)
+    payment_mode: str = ""
+    supplier_gst: str = ""
+    supplier_contact_person: str = ""
+    supplier_contact_number: str = ""
+    supplier_contact_email: str = ""
+    paid_amount: float = 0            # payment_mode "partial": amount paid now (INR)
+    credit_days: int = 0              # payment_mode "partial" / "credit": days to pay the rest
 
 
 class InventoryUpdateRequest(BaseModel):
@@ -316,7 +446,7 @@ class InventoryUpdateRequest(BaseModel):
     new_hologram_numbers: list[str] = []      # serial-wise hologram numbers to add (spare_parts / service_parts only)
     remove_hologram_numbers: list[str] = []
     source_product_type: Optional[str] = None  # type of the lot being edited (product / damaged / ...)
-    model_no: Optional[str] = None   # disambiguates which lot-document to touch when a product_id has multiple model_no variants
+    model_no: Optional[str] = None
 
 
 class ShipmentPart(BaseModel):
@@ -336,9 +466,20 @@ class ShipmentProduct(BaseModel):
 class CreateShipmentRequest(BaseModel):
     company_name: str
     company_address: str = ""
+    invoice_no: str = ""
     dispatch_date: str
     received_date: str = ""       # optional - can be added later via mark_received
     products: list[ShipmentProduct]
+    customer_id: str = ""
+    gst_number: str = ""
+    contractor_person: str = ""
+    contractor_number: str = ""
+    contractor_email: str = ""
+    payment_mode: str = "paid"    # "paid" | "partial" | "credit"
+    paid_amount: float = 0        # partial only: amount paid now (shipment currency)
+    credit_days: int = 0          # partial / credit: days within which the rest is paid
+    currency: str = "INR"
+    exchange_rate: float = 1
 
 
 class ShipmentReceivedRequest(BaseModel):
@@ -353,10 +494,12 @@ class AssemblyPartUsed(BaseModel):
     part_name: str
     quantity: int = 0
     source: str = "inventory"     # "inventory" (deduct from inventory's spare_parts stock) | "local" (sourced outside, no deduction)
+    belongs_to: str = ""          # product the part belongs to (auto-filled from inventory for source="inventory")
 
 
 class AssemblySerialItem(BaseModel):
     serial_number: str
+    lot_no: str = ""      # compulsory per unit (checked in create_assembly); lots may repeat or differ within a batch
 
 
 class ApproveAssemblyRequest(BaseModel):
@@ -385,7 +528,7 @@ class EditAssemblyRequest(BaseModel):
 
 @app.get("/")
 def home():
-    return RedirectResponse(url = "https://www.acerbiomedicals.com/")
+    return RedirectResponse(url = "https://endolaxmedicare.in/")
 
 
 @app.get("/main_dashboard.html")
@@ -407,10 +550,10 @@ def login_page(request: LoginRequest, http_request: Request):
 
         user = dataset[0]
 
-        if user["password"] != request.password or user["role"] != request.role:
+        if user["password"] != request.password:
             raise HTTPException(status_code=401, detail="details did not match")
 
-        if APP_CLIENT_KEY and user["role"] in APP_ONLY_ROLES:
+        if APP_CLIENT_KEY and user["role"] in APP_ONLY_ROLES and request.username not in("arun","prashant","amit","sachin","tarun","manu","gaurav", "sandeep","harsh","manideep","radhey shyam","vijay","aslam"):
             ua = http_request.headers.get("user-agent", "")
             if f"key={APP_CLIENT_KEY}" not in ua:
                 raise HTTPException(status_code=403, detail="this role can log in only from the desktop app")
@@ -420,6 +563,7 @@ def login_page(request: LoginRequest, http_request: Request):
         return {
             "message": "access granted",
             "role": user["role"],
+            "allowed_pages": user.get("allowed_pages") or None,
             "access_token": token,
             "token_type": "bearer"
         }
@@ -573,8 +717,8 @@ def create_account(request: CreateAccountRequest, user: dict = Depends(require_r
     except HTTPException:
         raise
     except Exception as e:
-        logging.error("account creation was failed!")
-        raise HTTPException(status_code=500, detail="account creation failed")
+        logging.exception("account creation was failed! role=%s username=%s", request.role, request.username)
+        raise HTTPException(status_code=500, detail=f"account creation failed: {e}")
 
 
 @app.post("/login/delete_account/{username}")
@@ -604,7 +748,152 @@ def update_account(username: str, updated_values: UpdateAccountRequest, user: di
         raise HTTPException(status_code=500, detail="account details updation was unsuccessful")
 
 
-VALID_PAYMENT_MODES = {"Credit", "NetBanking", "UPI", "Cheque", "DemandDraft", "Cash"}
+# ---------------------------------------------------------------------------
+# Page-access control (hidden admin page, not linked in any sidebar)
+#   Open  /access-control  in the browser after logging in as admin.
+#   A user with allowed_pages set can open ONLY those pages (and sees only
+#   those in the sidebar). allowed_pages = None -> the role's default pages.
+# ---------------------------------------------------------------------------
+ACCESS_PAGE_RE = re.compile(r"^[a-z0-9_]+\.html$")
+ACCESS_NON_GRANTABLE = {"access_control.html"}
+
+
+class AccessUpdateRequest(BaseModel):
+    allowed_pages: Optional[List[str]] = None   # None / [] = back to the role's default pages
+
+
+@app.get("/access-control")
+def access_control_page():
+    return FileResponse(os.path.join(BASE_DIR, "pages", "access_control.html"))
+
+
+@app.get("/account/my_access")
+def my_access(user: dict = Depends(get_current_user)):
+    """Logged-in user's own custom page list (None = role default). Pages call this to stay in sync."""
+    try:
+        db = mongodbclient()
+        dataset = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={"username": user.get("username")})
+        pages = (dataset[0].get("allowed_pages") if dataset else None) or None
+        return {"allowed_pages": pages}
+    except Exception:
+        logging.error("my access cannot be fetched")
+        raise HTTPException(status_code=500, detail="access cannot be fetched")
+
+
+@app.get("/access/users")
+def access_users(user: dict = Depends(require_role("admin"))):
+    try:
+        db = mongodbclient()
+        dataset = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={})
+        users = [
+            {"username": a.get("username"),
+             "name": a.get("name") or a.get("full_name") or a.get("username"),
+             "role": a.get("role"),
+             "allowed_pages": a.get("allowed_pages") or None}
+            for a in dataset
+        ]
+        return {"message": "access users", "dataset": users}
+    except Exception:
+        logging.error("access users cannot be fetched")
+        raise HTTPException(status_code=500, detail="users cannot be fetched")
+
+
+@app.post("/access/users/{username}")
+def set_user_access(username: str, request: AccessUpdateRequest, user: dict = Depends(require_role("admin"))):
+    try:
+        pages = None
+        if request.allowed_pages:
+            pages = []
+            for p in request.allowed_pages:
+                p = str(p).strip()
+                if not ACCESS_PAGE_RE.match(p):
+                    raise HTTPException(status_code=400, detail=f"invalid page {p}")
+                if p not in ACCESS_NON_GRANTABLE and p not in pages:
+                    pages.append(p)
+            pages = pages or None
+
+        db = mongodbclient()
+        dataset = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={"username": username})
+        if not dataset:
+            raise HTTPException(status_code=404, detail="user not found")
+
+        db.update_data(collection_name=ACCOUNTS_COLLECTION, query={"username": username},
+                       update_values={"allowed_pages": pages})
+        invalidate_access_cache(username)
+        logging.info("page access updated for %s", username)
+        return {"message": "access updated", "username": username, "allowed_pages": pages}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("page access cannot be updated")
+        raise HTTPException(status_code=500, detail="access cannot be updated")
+
+
+VALID_PAYMENT_MODES = {"Credit", "Partial", "NetBanking", "UPI", "Cheque", "DemandDraft", "Cash"}
+
+
+def _order_grand_total(items: list, discount: float = 0, warranty_charge: float = 0) -> float:
+    """price x qty + tax per line, minus discount, plus extended-warranty charge (same maths as order_manager.add)."""
+    total = 0.0
+    for it in items or []:
+        line = float(it.get("price", 0) or 0) * float(it.get("quantity", 0) or 0)
+        total += line + line * float(it.get("tax_rate", 0) or 0) / 100
+    return round(total - float(discount or 0) + float(warranty_charge or 0), 2)
+
+
+def _validate_order_payment(payment_mode: str, payment_details: dict, grand_total: float = 0) -> dict:
+    """Checks the payment mode + its details (shared by order creation and demo-unit conversion)
+    and returns the details to store. "Partial" = part paid now, the rest (balance) due after
+    credit_days; paid_amount / credit_days come in, balance_amount / due_date are added here."""
+    details = dict(payment_details or {})
+
+    if not payment_mode:
+        raise HTTPException(status_code=400, detail="select a payment mode")
+    if payment_mode not in VALID_PAYMENT_MODES:
+        raise HTTPException(status_code=400, detail="invalid payment mode")
+
+    if payment_mode == "Credit":
+        credit_days = details.get("credit_days")
+        if not credit_days or not (0 < int(credit_days) <= 60):
+            raise HTTPException(status_code=400, detail="credit days must be between 1 and 60")
+
+    if payment_mode == "Partial":
+        try:
+            paid = float(details.get("paid_amount") or 0)
+            days = int(details.get("credit_days") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="invalid partial payment details")
+        if paid <= 0:
+            raise HTTPException(status_code=400, detail="enter the amount paid now for a partial payment")
+        if not (0 < days <= 60):
+            raise HTTPException(status_code=400, detail="days for the remaining payment must be between 1 and 60")
+        if grand_total > 0 and paid >= grand_total:
+            raise HTTPException(status_code=400, detail="partial payment must be less than the order total - choose another payment mode")
+        details["paid_amount"] = round(paid, 2)
+        details["credit_days"] = days
+        details["balance_amount"] = round(max(grand_total - paid, 0), 2)
+        details["due_date"] = (datetime.now(timezone.utc) + timedelta(days=days)).date().isoformat()
+
+    if payment_mode == "Cheque" and not details.get("cheque_number"):
+        raise HTTPException(status_code=400, detail="cheque number is required")
+
+    if payment_mode == "DemandDraft" and not details.get("dd_number"):
+        raise HTTPException(status_code=400, detail="demand draft number is required")
+
+    if payment_mode == "UPI" and not details.get("upi_id"):
+        raise HTTPException(status_code=400, detail="UPI ID is required")
+
+    if payment_mode == "NetBanking" and not (
+        details.get("bank_name")
+        and details.get("account_number")
+        and details.get("ifsc_code")
+    ):
+        raise HTTPException(status_code=400, detail="bank name, account number and IFSC code are required")
+
+    if payment_mode == "Cash" and not details.get("received_by"):
+        raise HTTPException(status_code=400, detail="received-by person name is required")
+
+    return details
 
 
 def _raise_media_review_request(service_id: str, raised_by: str):
@@ -636,6 +925,29 @@ def _damaged_part_warranty(old_hologram: str):
     if not entries:
         return None
     return entries[0].get("warranty_until")
+
+
+def _faulty_already_filed(part_name: str, old_hologram: str) -> bool:
+    """True when this removed part (name + old hologram number) already sits in the Damaged inventory."""
+    if not old_hologram:
+        return False
+    found = inventory_manager().get_data(
+        collection_name=INVENTORY_COLLECTION,
+        query={"product_type": "damaged", "product_id": old_hologram, "product_name": part_name})
+    return bool(found)
+
+
+def _record_faulty_filed(service_id: str, holograms: list):
+    """Remember on the service which old hologram numbers were filed as faulty (shown on the Allocated Parts card)."""
+    try:
+        svc_db = service_detail()
+        svc = svc_db.get_service_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id})
+        have = list((svc[0].get("faulty_filed") if svc else None) or [])
+        merged = have + [h for h in holograms if h and h not in have]
+        svc_db.update_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id},
+                           update_values={"faulty_filed": merged})
+    except Exception as e:
+        logging.error(f"could not record faulty_filed for {service_id}: {e}")
 
 
 def _swap_faulty_part(service_id: str, parts_used: list):
@@ -681,6 +993,7 @@ def _swap_faulty_part(service_id: str, parts_used: list):
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     mismatch = False
+    filed_now = []
     for part in parts_used:
         part_name = part.get("part_name")
         old_hologram = part.get("old_hologram_number")
@@ -704,10 +1017,16 @@ def _swap_faulty_part(service_id: str, parts_used: list):
         # trail, its warranty_until on the entry already tells the story
         reason = "" if under_warranty else f"damaged part removed during service {service_id}"
 
-        inv_db = inventory_manager(product_name=part_name, product_id=old_hologram,
-                                    quantity=1, product_type="damaged",
-                                    warranty_until=warranty_until, reason=reason)
-        inv_db.add(collection_name=INVENTORY_COLLECTION)
+        # already filed as faulty (e.g. the manager used "Add to faulty" on the service page) -> don't add it twice
+        if not _faulty_already_filed(part_name, old_hologram):
+            inv_db = inventory_manager(product_name=part_name, product_id=old_hologram,
+                                        quantity=1, product_type="damaged",
+                                        warranty_until=warranty_until, reason=reason)
+            inv_db.add(collection_name=INVENTORY_COLLECTION)
+        filed_now.append(old_hologram)
+
+    if filed_now:
+        _record_faulty_filed(service_id, filed_now)
 
     if assembly is not None and serials is not None:
         asm_db.update(collection_name=ASSEMBLY_COLLECTION, query={"assembly_id": assembly["assembly_id"]},
@@ -717,6 +1036,58 @@ def _swap_faulty_part(service_id: str, parts_used: list):
     return mismatch
 
 
+# ---- never hand out a serial number that is already sold ----
+# Inventory lots can still list a serial that a live order / demo allocation already holds
+# (stale lot data, a restock that was never cleaned up, the same serial in two lots ...).
+# These helpers cross-check inventory serials against orders + allocations before auto-picking.
+_ORDER_STATUSES_NOT_HOLDING_STOCK = ["cancelled", "returned"]
+
+
+def _unsold_serials(serials):
+    """Returns the serials (original order kept) that are NOT held by a live order or a live
+    (not returned) allocation. Serials of returned orders that were restocked count as free."""
+    serials = [s for s in (serials or []) if s]
+    if not serials:
+        return []
+    db = mongodbclient()
+    taken = set()
+    for o in db.get_data(collection_name=ORDERS_COLLECTION,
+                         query={"items.serial_numbers": {"$in": serials},
+                                "status": {"$nin": _ORDER_STATUSES_NOT_HOLDING_STOCK}}):
+        back_in_stock = set(o.get("returned_serials_processed") or [])
+        for it in (o.get("items") or []):
+            for sn in (it.get("serial_numbers") or []):
+                if sn not in back_in_stock:
+                    taken.add(sn)
+    for a in db.get_data(collection_name=ALLOCATION_COLLECTION,
+                         query={"items.serial_numbers": {"$in": serials},
+                                "return_status": {"$ne": "returned"}}):
+        for it in (a.get("items") or []):
+            for sn in (it.get("serial_numbers") or []):
+                taken.add(sn)
+    return [sn for sn in serials if sn not in taken]
+
+
+def _auto_pick_units(inventory_db, product_id: str, quantity: int, model_no=None):
+    """Auto-allocation that skips already-sold serials. Serialised stock: the oldest UNSOLD serials
+    are picked. Un-serialised stock (accessories / spare parts with no serial on file) keeps using
+    the plain quantity allocator, since there is nothing to cross-check."""
+    model_no = model_no or None
+    candidates = inventory_db.list_available_serials(INVENTORY_COLLECTION, product_id, model_no=model_no)
+    if not candidates:
+        return inventory_db.allocate_units(collection_name=INVENTORY_COLLECTION, product_id=product_id,
+                                           quantity=quantity, model_no=model_no)
+    clean = _unsold_serials(candidates)
+    if len(clean) < quantity:
+        skipped = len(candidates) - len(clean)
+        raise HTTPException(
+            status_code=400,
+            detail=f"only {len(clean)} unsold serial number(s) available for {product_id}"
+                   f"{f' ({skipped} serial(s) on file are already sold - fix them in Inventory)' if skipped else ''}")
+    return inventory_db.allocate_specific_serials(collection_name=INVENTORY_COLLECTION, product_id=product_id,
+                                                  serial_numbers=clean[:quantity], model_no=model_no)
+
+
 def _fulfill_order(customer_id: str, customer: dict, items: list, payment_mode: str, payment_details: dict, discount: float, creator: dict = None, warranty_years: int = 1, warranty_charge: float = 0):
     """Validates payment details, resolves/creates the customer, deducts stock + serials,
     and creates the order record. Shared by the direct /order/create_order/ endpoint and by
@@ -724,32 +1095,7 @@ def _fulfill_order(customer_id: str, customer: dict, items: list, payment_mode: 
     if not items:
         raise HTTPException(status_code=400, detail="add at least one product to the order")
 
-    if payment_mode not in VALID_PAYMENT_MODES:
-        raise HTTPException(status_code=400, detail="invalid payment mode")
-
-    if payment_mode == "Credit":
-        credit_days = payment_details.get("credit_days")
-        if not credit_days or not (0 < int(credit_days) <= 60):
-            raise HTTPException(status_code=400, detail="credit days must be between 1 and 60")
-
-    if payment_mode == "Cheque" and not payment_details.get("cheque_number"):
-        raise HTTPException(status_code=400, detail="cheque number is required")
-
-    if payment_mode == "DemandDraft" and not payment_details.get("dd_number"):
-        raise HTTPException(status_code=400, detail="demand draft number is required")
-
-    if payment_mode == "UPI" and not payment_details.get("upi_id"):
-        raise HTTPException(status_code=400, detail="UPI ID is required")
-
-    if payment_mode == "NetBanking" and not (
-        payment_details.get("bank_name")
-        and payment_details.get("account_number")
-        and payment_details.get("ifsc_code")
-    ):
-        raise HTTPException(status_code=400, detail="bank name, account number and IFSC code are required")
-
-    if payment_mode == "Cash" and not payment_details.get("received_by"):
-        raise HTTPException(status_code=400, detail="received-by person name is required")
+    payment_details = _validate_order_payment(payment_mode, payment_details, _order_grand_total(items, discount, warranty_charge))
 
     customer_db = customer_manager()
     customer_snapshot = dict(customer or {})
@@ -823,12 +1169,7 @@ def _fulfill_order(customer_id: str, customer: dict, items: list, payment_mode: 
             except Exception as e:
                 raise HTTPException(status_code=400, detail=str(e))
         else:
-            allocated_serials = inventory_db.allocate_units(
-                collection_name=INVENTORY_COLLECTION,
-                product_id=item["product_id"],
-                quantity=item["quantity"],
-                model_no=item.get("model_no") or None
-            )
+            allocated_serials = _auto_pick_units(inventory_db, item["product_id"], item["quantity"], item.get("model_no") or None)
         order_item = dict(item)
         order_item["serial_numbers"] = allocated_serials
         order_items.append(order_item)
@@ -851,7 +1192,12 @@ def _fulfill_order(customer_id: str, customer: dict, items: list, payment_mode: 
 
 @app.post("/order/create_order/")
 def create_order(request: CreateOrderRequest, user: dict = Depends(require_role("admin", "accounts"))):
+    reference = (request.reference or "").strip()
+    if not reference:
+        raise HTTPException(status_code=400, detail="reference is required, please select a reference user")
     try:
+        if not mongodbclient().get_data(collection_name=ACCOUNTS_COLLECTION, query={"username": reference}):
+            raise HTTPException(status_code=400, detail="selected reference user does not exist")
         order_id = _fulfill_order(
             customer_id=request.customer_id,
             customer=request.customer,
@@ -863,6 +1209,8 @@ def create_order(request: CreateOrderRequest, user: dict = Depends(require_role(
             warranty_years=request.warranty_years,
             warranty_charge=request.warranty_charge
         )
+        order_manager().update(collection_name=ORDERS_COLLECTION, query={"order_id": order_id},
+                               update_values={"reference": reference})
         return {"message": "order created successfully", "order_id": order_id}
 
     except HTTPException:
@@ -1438,6 +1786,7 @@ def sync_shipment_parts_to_inventory(shipment: dict, received_date: str):
             supplier=shipment.get("company_name", ""),
             supplier_address=shipment.get("company_address", ""),
             purchase_date=received_date,
+            invoice_no=shipment.get("invoice_no", "") or "",
         )
     if purchase_parts_needed:
         sync_results += inv_db.add_from_shipment_parts(
@@ -1448,6 +1797,7 @@ def sync_shipment_parts_to_inventory(shipment: dict, received_date: str):
             supplier=shipment.get("company_name", ""),
             supplier_address=shipment.get("company_address", ""),
             purchase_date=received_date,
+            invoice_no=shipment.get("invoice_no", "") or "",
         )
     if warranty_parts_needed:
         sync_results += inv_db.add_from_shipment_parts(
@@ -1459,8 +1809,136 @@ def sync_shipment_parts_to_inventory(shipment: dict, received_date: str):
             supplier=shipment.get("company_name", ""),
             supplier_address=shipment.get("company_address", ""),
             purchase_date=received_date,
+            invoice_no=shipment.get("invoice_no", "") or "",
         )
     return sync_results
+
+
+def _validate_payment(mode, total, paid_amount, credit_days):
+    """400s on a bad paid / partial / credit choice (total and paid_amount in the same currency)."""
+    mode = (mode or "").strip().lower()
+    if mode not in ("paid", "partial", "credit"):
+        return
+    if mode in ("partial", "credit") and int(credit_days or 0) <= 0:
+        raise HTTPException(status_code=400, detail="enter in how many days the remaining payment will be made")
+    if mode in ("partial", "credit") and int(credit_days or 0) > 365:
+        raise HTTPException(status_code=400, detail="credit days cannot be more than 365")
+    if mode == "partial":
+        paid = float(paid_amount or 0)
+        if paid <= 0:
+            raise HTTPException(status_code=400, detail="enter the amount paid now for a partial payment")
+        if float(total or 0) > 0 and paid >= float(total):
+            raise HTTPException(status_code=400, detail="partial payment must be less than the total - choose Paid instead")
+
+
+def _purchase_record_payment(mode, amount_inr, paid_inr, credit_days, base_date, old_payments=None):
+    """Payment fields stored on a customer["purchases"] row (all INR)."""
+    pay = compute_payment(mode, amount_inr, paid_inr, credit_days, base_date)
+    return {
+        "payment_mode": pay["payment_mode"],
+        "paid_amount": pay["paid_amount"],      # paid at purchase time
+        "credit_days": pay["credit_days"],
+        "due_date": pay["due_date"],
+        "payments": list(old_payments or []),   # settlements recorded later from the users page
+    }
+
+
+def _sync_shipment_ledger(shipment: dict, user: dict, contact: dict = None):
+    sid = shipment["shipment_id"]
+    db = customer_manager()
+    old_payments = []     # settlements recorded later must survive a shipment edit
+    for c in db.get_data(collection_name=CUSTOMER_COLLECTION, query={}):
+        old = c.get("purchases") or []
+        kept = [p for p in old if p.get("shipment_id") != sid]
+        if len(kept) != len(old):
+            for p in old:
+                if p.get("shipment_id") == sid:
+                    old_payments += list(p.get("payments") or [])
+            db.update_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": c["customer_id"]}, update_values={"purchases": kept})
+    mode = (shipment.get("payment_mode") or "").lower()
+    amount = float(shipment.get("total_inr") or 0)
+    name = (shipment.get("company_name") or "").strip()
+    if mode not in ("paid", "partial", "credit") or amount <= 0 or not name:
+        return None
+    rate = float(shipment.get("exchange_rate") or 1)
+    paid_inr = round(float(shipment.get("paid_amount") or 0) * rate, 2)
+    contact = contact or {}
+    rows = db.get_data(collection_name=CUSTOMER_COLLECTION, query={})
+    match = next((c for c in rows if shipment.get("customer_id") and c.get("customer_id") == shipment["customer_id"]), None)
+    if match is None:
+        match = next((c for c in rows if (c.get("company_name") or "").strip().lower() == name.lower()), None)
+    if match is None:
+        nc = customer_manager(
+            company_name=name,
+            company_address=shipment.get("company_address", ""),
+            gst_number=contact.get("gst_number", ""),
+            contractor_person=contact.get("contractor_person", ""),
+            contractor_number=contact.get("contractor_number", ""),
+            contractor_email=contact.get("contractor_email", ""),
+        )
+        nc.add(collection_name=CUSTOMER_COLLECTION)
+        db.update_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": nc.customer_id},
+                       update_values={"credit_limit": 0, "credit_used": 0, "created_by": user["username"]})
+        customer_id, purchases = nc.customer_id, []
+    else:
+        customer_id, purchases = match["customer_id"], list(match.get("purchases") or [])
+    products = shipment.get("products") or []
+    purchases.append({
+        "purchase_id": str(uuid.uuid4()),
+        "shipment_id": sid,
+        "source": "shipment",
+        "date": shipment.get("dispatch_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "product_name": ", ".join(f"{p.get('product_name')} x{p.get('quantity')}" for p in products),
+        "quantity": sum(int(p.get("quantity") or 0) for p in products),
+        "lot_no": f"Shipment {sid[:8]}",
+        "amount": round(amount, 2),
+        **_purchase_record_payment(mode, amount, paid_inr, shipment.get("credit_days"),
+                                   shipment.get("dispatch_date"), old_payments),
+        "currency": shipment.get("currency", "INR"),
+        "exchange_rate": shipment.get("exchange_rate", 1),
+        "original_amount": shipment.get("total_amount", amount),
+        "added_by": user["username"],
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    })
+    db.update_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": customer_id}, update_values={"purchases": purchases})
+    shipment_manager().update(collection_name=SHIPMENT_COLLECTION, query={"shipment_id": sid}, update_values={"customer_id": customer_id})
+    return customer_id
+
+
+@app.get("/shipment/fx_rate")
+def shipment_fx_rate(currency: str, user: dict = Depends(get_current_user)):
+    import json
+    import urllib.request
+    cur = (currency or "").strip().upper()
+    if cur == "INR":
+        return {"currency": "INR", "rate": 1, "as_of": ""}
+    try:
+        with urllib.request.urlopen(f"https://open.er-api.com/v6/latest/{cur}", timeout=8) as r:
+            data = json.loads(r.read().decode())
+        return {"currency": cur, "rate": float(data["rates"]["INR"]), "as_of": data.get("time_last_update_utc", "")}
+    except Exception:
+        logging.error("fx rate fetch failed")
+        raise HTTPException(status_code=502, detail="live exchange rate unavailable, enter the rate manually")
+
+
+@app.get("/invoice/lookup")
+def invoice_lookup(invoice_no: str, user: dict = Depends(require_role("inventory_manager", "admin", "accounts"))):
+    inv = (invoice_no or "").strip()
+    if not inv:
+        return {"found": False}
+    pattern = {"$regex": "^" + re.escape(inv) + "$", "$options": "i"}
+    try:
+        for entry in inventory_manager().get_data(collection_name=INVENTORY_COLLECTION, query={"invoice_no": pattern}):
+            if entry.get("supplier"):
+                return {"found": True, "source": "inventory", "company_name": entry["supplier"],
+                        "company_address": entry.get("supplier_address", "") or ""}
+        for ship in shipment_manager().get_data(collection_name=SHIPMENT_COLLECTION, query={"invoice_no": pattern}):
+            if ship.get("company_name"):
+                return {"found": True, "source": "shipment", "company_name": ship["company_name"],
+                        "company_address": ship.get("company_address", "") or ""}
+    except Exception as e:
+        logging.error(f"invoice lookup failed: {e}")
+    return {"found": False}
 
 
 @app.get("/shipment/")
@@ -1491,20 +1969,38 @@ def track_shipment(shipment_id: str, user: dict = Depends(require_role("inventor
 @app.post("/shipment/create")
 def create_shipment(request: CreateShipmentRequest, user: dict = Depends(require_role("inventory_manager", "admin", "accounts"))):
     try:
+        _validate_payment(request.payment_mode, sum(float(p.price or 0) * float(p.quantity or 0) for p in request.products),
+                          request.paid_amount, request.credit_days)
         shipment_dict = {
             "company_name": request.company_name,
             "company_address": request.company_address,
+            "invoice_no": (request.invoice_no or "").strip(),
             "products": [product.dict() for product in request.products],
         }
         shipment_item = shipment_manager(
             company_name=request.company_name,
             company_address=request.company_address,
+            invoice_no=request.invoice_no,
             dispatch_date=request.dispatch_date,
             received_date=request.received_date or None,
             products=shipment_dict["products"],
             created_by=user["username"],
+            customer_id=request.customer_id,
+            payment_mode=request.payment_mode,
+            currency=request.currency,
+            exchange_rate=request.exchange_rate,
+            paid_amount=request.paid_amount,
+            credit_days=request.credit_days,
         )
         _, shipment_id = shipment_item.add(collection_name=SHIPMENT_COLLECTION)
+        ledger_customer_id = None
+        try:
+            saved = shipment_item.get_data(collection_name=SHIPMENT_COLLECTION, query={"shipment_id": shipment_id})[0]
+            ledger_customer_id = _sync_shipment_ledger(saved, user, {
+                "gst_number": request.gst_number, "contractor_person": request.contractor_person,
+                "contractor_number": request.contractor_number, "contractor_email": request.contractor_email})
+        except Exception as led_err:
+            logging.error(f"shipment {shipment_id} created but customer ledger sync failed: {led_err}")
         logging.info("shipment created successfully")
 
         inventory_sync = "skipped"
@@ -1519,7 +2015,7 @@ def create_shipment(request: CreateShipmentRequest, user: dict = Depends(require
                 logging.error(f"shipment {shipment_id} created received but parts->inventory sync failed: {inv_err}")
                 inventory_sync = f"failed: {inv_err}"
 
-        return {"message": "shipment created successfully", "shipment_id": shipment_id, "inventory_sync": inventory_sync}
+        return {"message": "shipment created successfully", "shipment_id": shipment_id, "inventory_sync": inventory_sync, "customer_id": ledger_customer_id}
 
     except HTTPException:
         raise
@@ -1570,12 +2066,33 @@ def update_shipment(shipment_id: str, request: ShipmentUpdateRequest, user: dict
             raise HTTPException(status_code=404, detail="no shipment found with this shipment_id")
 
         updated = dict(request.updated_values)
+        contact = {k: updated.pop(k, "") for k in ("gst_number", "contractor_person", "contractor_number", "contractor_email")}
+        if "currency" in updated:
+            updated["currency"] = (updated["currency"] or "INR").upper()
+            if updated["currency"] == "INR":
+                updated["exchange_rate"] = 1.0
+        if updated.get("payment_mode") not in (None, "paid", "partial", "credit"):
+            updated["payment_mode"] = "paid"
+        merged = {**existing[0], **updated}
+        total_amount = sum((float(p.get("price") or 0) * float(p.get("quantity") or 0)) for p in merged.get("products", []))
+        updated["total_amount"] = total_amount
+        updated["total_inr"] = round(total_amount * float(merged.get("exchange_rate") or 1), 2)
+        _validate_payment(merged.get("payment_mode"), total_amount, merged.get("paid_amount"), merged.get("credit_days"))
+        pay = compute_payment(merged.get("payment_mode"), total_amount, merged.get("paid_amount"), merged.get("credit_days"),
+                              merged.get("dispatch_date"))
+        updated.update({"payment_mode": pay["payment_mode"], "paid_amount": pay["paid_amount"],
+                        "credit_days": pay["credit_days"], "due_date": pay["due_date"]})
         # keep status in sync if the caller is editing received_date directly
         if "received_date" in updated:
             updated["status"] = "received" if updated["received_date"] else "pending"
 
         db.update(collection_name=SHIPMENT_COLLECTION, query={"shipment_id": shipment_id}, update_values=updated)
         logging.info("shipment value was updated successfully.")
+        try:
+            fresh = db.get_data(collection_name=SHIPMENT_COLLECTION, query={"shipment_id": shipment_id})[0]
+            _sync_shipment_ledger(fresh, user, contact)
+        except Exception as led_err:
+            logging.error(f"shipment {shipment_id} updated but customer ledger sync failed: {led_err}")
         return {"message": "shipment value was updated", "shipment_id": shipment_id, "updated_value": updated}
 
     except HTTPException:
@@ -1590,6 +2107,10 @@ def delete_shipment(shipment_id: str, user: dict = Depends(require_role("admin")
     try:
         db = shipment_manager()
         db.delete(collection_name=SHIPMENT_COLLECTION, query={"shipment_id": shipment_id})
+        try:
+            _sync_shipment_ledger({"shipment_id": shipment_id}, user)
+        except Exception as led_err:
+            logging.error(f"shipment {shipment_id} deleted but customer ledger cleanup failed: {led_err}")
         return {"message": "shipment deleted", "shipment_id": shipment_id}
     except Exception as e:
         logging.error("shipment deletion failed")
@@ -1610,6 +2131,40 @@ def assembly(user: dict = Depends(require_role("inventory_manager", "assembly", 
     except Exception as e:
         logging.error("assembly dataset cannot be fetched")
         raise HTTPException(status_code=500, detail="assembly dataset cannot be fetched")
+
+
+def _spare_part_parents() -> dict:
+    """part_name -> list of parent product name(s) it is stocked under in inventory spare_parts."""
+    parents: dict[str, list] = {}
+    for entry in inventory_manager().get_data(collection_name=INVENTORY_COLLECTION, query={"product_type": "spare_parts"}):
+        name = entry.get("product_name", "")
+        pn = (entry.get("parent_product_name") or "").strip()
+        if name and pn and pn not in parents.setdefault(name, []):
+            parents[name].append(pn)
+    return parents
+
+
+def _fill_belongs_to(parts: list, strict: bool = True) -> list:
+    """
+    Inventory parts are identified by part_name + belongs_to. If belongs_to is missing
+    and the part is stocked under exactly one product, it is filled in. If it is stocked
+    under several products the caller must say which one (strict -> 400; otherwise skipped,
+    used for legacy records). Local parts keep whatever was typed.
+    """
+    parents = _spare_part_parents()
+    for p in parts:
+        p["belongs_to"] = (p.get("belongs_to") or "").strip()
+        if p.get("source", "inventory") == "local" or p["belongs_to"]:
+            continue
+        options = parents.get(p.get("part_name", ""), [])
+        if len(options) == 1:
+            p["belongs_to"] = options[0]
+        elif len(options) > 1 and strict:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{p.get('part_name')}' is stocked under several products ({', '.join(options)}) — choose which product it belongs to",
+            )
+    return parts
 
 
 @app.get("/assembly/available_parts")
@@ -1637,13 +2192,15 @@ def available_parts_for_assembly(user: dict = Depends(require_role("inventory_ma
             hologram_count = len(entry.get("hologram_numbers") or [])
             if not name or qty <= 0 or hologram_count <= 0:
                 continue
-            agg = pool.setdefault(name, {"quantity": 0, "hologram_available": 0})
+            pn = (entry.get("parent_product_name") or "").strip()
+            agg = pool.setdefault((name, pn), {"quantity": 0, "hologram_available": 0})
             agg["quantity"] += qty
             agg["hologram_available"] += hologram_count
 
         available = [
-            {"part_name": name, "quantity": v["quantity"], "hologram_available": v["hologram_available"]}
-            for name, v in pool.items()
+            {"part_name": name, "quantity": v["quantity"], "hologram_available": v["hologram_available"],
+             "belongs_to": pn}
+            for (name, pn), v in sorted(pool.items(), key=lambda kv: (kv[0][0].lower(), kv[0][1].lower()))
         ]
         return {"message": "available parts", "dataset": available}
     except Exception as e:
@@ -1667,7 +2224,7 @@ def track_assembly(assembly_id: str, user: dict = Depends(require_role("inventor
 @app.post("/assembly/create")
 def create_assembly(request: CreateAssemblyRequest, user: dict = Depends(require_role("inventory_manager", "assembly", "admin", "accounts"))):
     try:
-        parts_used = [part.dict() for part in request.parts_used]
+        parts_used = _fill_belongs_to([part.dict() for part in request.parts_used])
 
         if len(request.serials) != request.quantity:
             raise HTTPException(status_code=400, detail="number of serial numbers must match the assembly quantity")
@@ -1676,13 +2233,19 @@ def create_assembly(request: CreateAssemblyRequest, user: dict = Depends(require
             raise HTTPException(status_code=400, detail="every unit needs a serial number")
         if len(set(serial_values)) != len(serial_values):
             raise HTTPException(status_code=400, detail="serial numbers must be unique within this batch")
+        # lot number is compulsory for every unit — but no guard on its value: one assembly can
+        # have several different lot numbers and the same lot can repeat across units
+        lot_values = [(s.lot_no or "").strip() for s in request.serials]
+        if any(not l for l in lot_values):
+            raise HTTPException(status_code=400, detail="every unit needs a lot number")
 
         # sum up everything sourced from inventory, merging duplicate part names
-        needed_from_inventory: dict[str, int] = {}
+        needed_from_inventory: dict[tuple, int] = {}   # (part_name, belongs_to) -> qty
         for p in parts_used:
             if p["source"] != "inventory" or p["quantity"] <= 0:
                 continue
-            needed_from_inventory[p["part_name"]] = needed_from_inventory.get(p["part_name"], 0) + p["quantity"]
+            k = (p["part_name"], p.get("belongs_to", ""))
+            needed_from_inventory[k] = needed_from_inventory.get(k, 0) + p["quantity"]
 
         if not needed_from_inventory:
             raise HTTPException(
@@ -1704,15 +2267,16 @@ def create_assembly(request: CreateAssemblyRequest, user: dict = Depends(require
             )
         # pick the first qualifying part (in the order it was entered) as the
         # hologram-bearing part
-        hologram_part_name = hologram_candidates[0]
+        hologram_key = hologram_candidates[0]          # (part_name, belongs_to)
+        hologram_part_name = hologram_key[0]
 
         # how much of each inventory part actually gets consumed: the hologram
         # part only gives up exactly `request.quantity` (one per unit) — any
         # extra the user entered for it stays untouched in inventory. Every
         # other part is consumed at the full quantity entered for it.
         consume_amounts = {
-            name: (request.quantity if name == hologram_part_name else qty)
-            for name, qty in needed_from_inventory.items()
+            key: (request.quantity if key == hologram_key else qty)
+            for key, qty in needed_from_inventory.items()
         }
 
         inv_db = inventory_manager()
@@ -1720,32 +2284,37 @@ def create_assembly(request: CreateAssemblyRequest, user: dict = Depends(require
         # validate stock (and, for the hologram part, hologram numbers on file) is
         # sufficient for EVERY part before deducting any of them — otherwise a
         # shortage on part #2 would leave part #1 already (irreversibly) deducted
-        for part_name, qty in consume_amounts.items():
+        for (part_name, belongs), qty in consume_amounts.items():
             have = inv_db.get_available_quantity_by_name(
-                collection_name=INVENTORY_COLLECTION, product_name=part_name, product_type="spare_parts"
+                collection_name=INVENTORY_COLLECTION, product_name=part_name, product_type="spare_parts",
+                parent_product_name=belongs or None,
             )
             if have < qty:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"not enough '{part_name}' in inventory spare parts (need {qty}, have {have})",
+                    detail=f"not enough '{part_name}'{' (' + belongs + ')' if belongs else ''} in inventory spare parts (need {qty}, have {have})",
                 )
-            if part_name == hologram_part_name:
+            if (part_name, belongs) == hologram_key:
                 hologram_have = inv_db.get_hologram_available_by_name(
-                    collection_name=INVENTORY_COLLECTION, product_name=part_name, product_type="spare_parts"
+                    collection_name=INVENTORY_COLLECTION, product_name=part_name, product_type="spare_parts",
+                    parent_product_name=belongs or None,
                 )
                 if hologram_have < request.quantity:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"not enough hologram-tagged '{part_name}' in inventory (need {request.quantity}, have {hologram_have})",
+                        detail=f"not enough hologram-tagged '{part_name}'{' (' + belongs + ')' if belongs else ''} in inventory (need {request.quantity}, have {hologram_have})",
                     )
 
         # stock confirmed for every part — now actually deduct
         hologram_numbers: list[str] = []
-        for part_name, qty in consume_amounts.items():
-            if part_name == hologram_part_name:
+        part_lots: dict = {}
+        for (part_name, belongs), qty in consume_amounts.items():
+            part_lots[(part_name, belongs)] = []
+            if (part_name, belongs) == hologram_key:
                 hologram_numbers = inv_db.allocate_hologram_numbers_by_name(
                     collection_name=INVENTORY_COLLECTION, product_name=part_name,
                     product_type="spare_parts", quantity=request.quantity,
+                    parent_product_name=belongs or None, collect=part_lots[(part_name, belongs)],
                 )
                 # any quantity beyond one-per-unit is left untouched in
                 # inventory — we only take what's needed
@@ -1753,13 +2322,14 @@ def create_assembly(request: CreateAssemblyRequest, user: dict = Depends(require
                 inv_db.consume_quantity(
                     collection_name=INVENTORY_COLLECTION, product_name=part_name,
                     product_type="spare_parts", quantity=qty,
+                    parent_product_name=belongs or None, collect=part_lots[(part_name, belongs)],
                 )
 
         if len(hologram_numbers) != request.quantity:
             raise HTTPException(status_code=500, detail="could not allocate a hologram number for every assembled unit")
 
         serials = [
-            {"serial_number": s.serial_number.strip(), "hologram_number": hologram_numbers[i]}
+            {"serial_number": s.serial_number.strip(), "hologram_number": hologram_numbers[i], "lot_no": lot_values[i]}
             for i, s in enumerate(request.serials)
         ]
 
@@ -1772,8 +2342,15 @@ def create_assembly(request: CreateAssemblyRequest, user: dict = Depends(require
             serials=serials,
             created_by=user["username"],
             hologram_part=hologram_part_name,
+            hologram_part_belongs_to=hologram_key[1],
         )
         _, assembly_id = assembly_item.add(collection_name=ASSEMBLY_COLLECTION)
+        try:
+            assembly_manager().update(
+                collection_name=ASSEMBLY_COLLECTION, query={"assembly_id": assembly_id},
+                update_values={"part_sources": [{"part_name": k[0], "belongs_to": k[1], "lots": v} for k, v in part_lots.items()]})
+        except Exception as src_err:
+            logging.error(f"assembly {assembly_id} created but part sources could not be saved: {src_err}")
         logging.info("assembly created successfully")
         return {"message": "assembly created successfully", "assembly_id": assembly_id}
 
@@ -1838,6 +2415,9 @@ def approve_assembly(assembly_id: str, request: ApproveAssemblyRequest, user: di
         if not new_serials:
             raise HTTPException(status_code=400, detail="select at least one serial number that is not approved yet")
 
+        # a unit's serial must never enter inventory twice
+        _assert_unique_product_serials(new_serials)
+
         # inventory first - if this fails nothing is marked approved
         inv_db = inventory_manager()
         sync_result = inv_db.add_from_assembly(
@@ -1848,6 +2428,9 @@ def approve_assembly(assembly_id: str, request: ApproveAssemblyRequest, user: di
             quantity=len(new_serials),
             serial_numbers=new_serials,
             purchase_date=datetime.now(timezone.utc).date().isoformat(),
+            # the same lot numbers entered in the assembly go into inventory with their units
+            serial_lots=[{"serial_number": sv.get("serial_number"), "lot_no": sv.get("lot_no", "")}
+                         for sv in assembly.get("serials", []) if sv.get("serial_number") in set(new_serials)],
         )
 
         approved_all = list(already) + new_serials
@@ -1898,13 +2481,14 @@ def update_assembly(assembly_id: str, request: AssemblyUpdateRequest, user: dict
 
 
 def _inventory_needed(parts_used: list) -> dict:
-    """Sums the quantity of every inventory-sourced part by name (local parts never touch inventory)."""
-    needed: dict[str, int] = {}
+    """Sums the quantity of every inventory-sourced part by (part_name, belongs_to) — local parts never touch inventory."""
+    needed: dict[tuple, int] = {}
     for p in parts_used or []:
         qty = int(p.get("quantity", 0) or 0)
         if p.get("source", "inventory") != "inventory" or qty <= 0:
             continue
-        needed[p["part_name"]] = needed.get(p["part_name"], 0) + qty
+        k = (p["part_name"], p.get("belongs_to", "") or "")
+        needed[k] = needed.get(k, 0) + qty
     return needed
 
 
@@ -1937,25 +2521,31 @@ def edit_assembly(assembly_id: str, request: EditAssemblyRequest, user: dict = D
             )
 
         quantity = int(assembly.get("quantity", 0) or 0)
-        new_parts = assembly_manager._normalize_parts_used([p.dict() for p in request.parts_used])
+        new_parts = assembly_manager._normalize_parts_used(_fill_belongs_to([p.dict() for p in request.parts_used]))
+        old_parts = _fill_belongs_to([dict(p) for p in assembly.get("parts_used", [])], strict=False)   # legacy records
         if any(int(p["quantity"]) < 0 for p in new_parts):
             raise HTTPException(status_code=400, detail="part quantity cannot be negative")
 
-        old_needed = _inventory_needed(assembly.get("parts_used", []))
+        old_needed = _inventory_needed(old_parts)
         new_needed = _inventory_needed(new_parts)
 
         # the part that supplied the hologram numbers when the assembly was created
         # (older records without the field: same rule create uses — first part in
         # entered order whose quantity reached the assembly quantity)
-        hologram_part = assembly.get("hologram_part") or next(
-            (name for name, qty in old_needed.items() if qty >= quantity), None
-        )
+        h_name = assembly.get("hologram_part")
+        if h_name:
+            h_belongs = assembly.get("hologram_part_belongs_to", "") or ""
+            hologram_part = (h_name, h_belongs)
+            if hologram_part not in old_needed:      # legacy record: match by name only
+                hologram_part = next((k for k in old_needed if k[0] == h_name), hologram_part)
+        else:
+            hologram_part = next((k for k, qty in old_needed.items() if qty >= quantity), None)
         if not hologram_part:
             raise HTTPException(status_code=400, detail="this assembly has no hologram-bearing part on record, so it cannot be edited")
         if new_needed.get(hologram_part, 0) < quantity:
             raise HTTPException(
                 status_code=400,
-                detail=f"'{hologram_part}' supplies the hologram numbers, so its inventory quantity must stay at least {quantity}",
+                detail=f"'{hologram_part[0]}'{' (' + hologram_part[1] + ')' if hologram_part[1] else ''} supplies the hologram numbers, so its inventory quantity must stay at least {quantity}",
             )
 
         # what each inventory part actually consumes (hologram part: exactly one per unit)
@@ -1973,48 +2563,56 @@ def edit_assembly(assembly_id: str, request: EditAssemblyRequest, user: dict = D
         for name, diff in deltas.items():
             if diff > 0:
                 have = inv_db.get_available_quantity_by_name(
-                    collection_name=INVENTORY_COLLECTION, product_name=name, product_type="spare_parts"
+                    collection_name=INVENTORY_COLLECTION, product_name=name[0], product_type="spare_parts",
+                    parent_product_name=name[1] or None,
                 )
                 if have < diff:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"not enough '{name}' in inventory spare parts (need {diff} more, have {have})",
+                        detail=f"not enough '{name[0]}'{' (' + name[1] + ')' if name[1] else ''} in inventory spare parts (need {diff} more, have {have})",
                     )
 
         applied = []      # (name, diff) already pushed to inventory, for rollback
+        extra_lots: dict = {}
 
         def _rollback():
             for r_name, r_diff in reversed(applied):
                 try:
                     if r_diff > 0:
-                        inv_db.restock_quantity(collection_name=INVENTORY_COLLECTION, product_name=r_name,
-                                                product_type="spare_parts", quantity=r_diff, updated_by=user["username"])
+                        inv_db.restock_quantity(collection_name=INVENTORY_COLLECTION, product_name=r_name[0],
+                                                product_type="spare_parts", quantity=r_diff, updated_by=user["username"],
+                                                parent_product_name=r_name[1] or None)
                     else:
-                        inv_db.consume_quantity(collection_name=INVENTORY_COLLECTION, product_name=r_name,
-                                                product_type="spare_parts", quantity=-r_diff)
+                        inv_db.consume_quantity(collection_name=INVENTORY_COLLECTION, product_name=r_name[0],
+                                                product_type="spare_parts", quantity=-r_diff,
+                                                parent_product_name=r_name[1] or None)
                 except Exception as rb_err:
                     logging.error(f"assembly edit rollback failed for '{r_name}': {rb_err}")
 
         try:
             for name, diff in deltas.items():
                 if diff > 0:
-                    inv_db.consume_quantity(collection_name=INVENTORY_COLLECTION, product_name=name,
-                                            product_type="spare_parts", quantity=diff)
+                    extra_lots[name] = []
+                    inv_db.consume_quantity(collection_name=INVENTORY_COLLECTION, product_name=name[0],
+                                            product_type="spare_parts", quantity=diff,
+                                            parent_product_name=name[1] or None, collect=extra_lots[name])
                     applied.append((name, diff))
             for name, diff in deltas.items():
                 if diff < 0:
-                    inv_db.restock_quantity(collection_name=INVENTORY_COLLECTION, product_name=name,
-                                            product_type="spare_parts", quantity=-diff, updated_by=user["username"])
+                    inv_db.restock_quantity(collection_name=INVENTORY_COLLECTION, product_name=name[0],
+                                            product_type="spare_parts", quantity=-diff, updated_by=user["username"],
+                                            parent_product_name=name[1] or None)
                     applied.append((name, diff))
 
             inventory_changes = [
-                {"part_name": name, "action": "deducted" if diff > 0 else "restocked", "quantity": abs(diff)}
+                {"part_name": name[0], "belongs_to": name[1], "action": "deducted" if diff > 0 else "restocked", "quantity": abs(diff)}
                 for name, diff in deltas.items()
             ]
             now = datetime.now(timezone.utc).isoformat()
             update_values = {
                 "parts_used": new_parts,
-                "hologram_part": hologram_part,
+                "hologram_part": hologram_part[0],
+                "hologram_part_belongs_to": hologram_part[1],
                 "updated_by": user["username"],
                 "updated_at": now,
                 "edit_history": list(assembly.get("edit_history") or []) + [{
@@ -2024,6 +2622,15 @@ def edit_assembly(assembly_id: str, request: EditAssemblyRequest, user: dict = D
                     "inventory_changes": inventory_changes,
                 }],
             }
+            if extra_lots:
+                sources = [dict(s, lots=list(s.get("lots") or [])) for s in (assembly.get("part_sources") or [])]
+                for key, lots in extra_lots.items():
+                    hit = next((s for s in sources if s.get("part_name") == key[0] and (s.get("belongs_to") or "") == (key[1] or "")), None)
+                    if hit is None:
+                        hit = {"part_name": key[0], "belongs_to": key[1], "lots": []}
+                        sources.append(hit)
+                    hit["lots"].extend(lots)
+                update_values["part_sources"] = sources
             for field, value in (("product_name", request.product_name),
                                  ("product_id", request.product_id),
                                  ("model_number", request.model_number)):
@@ -2147,6 +2754,7 @@ def ensure_indexes():
         ACCOUNTS_COLLECTION: ["username", "role"],
         CUSTOMER_COLLECTION: ["customer_id"],
         SERVICE_COLLECTION: ["service_id"],
+        INSTALLATION_COLLECTION: ["installation_id", "technician_id", "status"],
     }
     db = mongodbclient().database
     for coll, fields in wanted.items():
@@ -2171,6 +2779,7 @@ def _warm_up_db():
 @app.on_event("startup")
 def _create_indexes_on_startup():
     threading.Thread(target=_warm_up_db, daemon=True).start()
+    threading.Thread(target=_reminder_loop, daemon=True).start()
 
 
 def purge_stale_damage_images():
@@ -2255,8 +2864,9 @@ def dispatch_queue(user: dict = Depends(require_role("service_manager", "admin",
     try:
         run_in_background("migrate_dispatch_media", migrate_stale_dispatch_media, 600)
         odb = order_manager()
-        # "dispatched" orders must stay in this queue's dispatched list, so fetch both statuses
-        all_orders = odb.get_data(collection_name=ORDERS_COLLECTION, query={"status": {"$in": ["processing", "dispatched"]}})
+        # dispatched orders must stay in this queue's dispatched list even after they are marked
+        # "delivered", so fetch all three statuses
+        all_orders = odb.get_data(collection_name=ORDERS_COLLECTION, query={"status": {"$in": ["processing", "dispatched", "delivered"]}})
         pending_orders = [o for o in all_orders if o.get("status") == "processing" and not o.get("dispatch")]
 
         adb = allocation_manager()
@@ -2267,9 +2877,38 @@ def dispatch_queue(user: dict = Depends(require_role("service_manager", "admin",
         all_product_alloc = [a for a in all_alloc if a.get("allocation_type") != "spare_part" and a.get("sent_to_dispatch")]
         pending_product_alloc = [a for a in all_product_alloc if not a.get("dispatch")]
 
+        pending_services, dispatched_services = [], []
+        try:
+            for sv in service_detail(product_id="", serial_no="").get_data(collection_name=SERVICE_COLLECTION, query={"status": "completed"}, projection={"image": 0, "video": 0}):
+                sv.pop("_id", None)
+                sv["allocation_id"] = sv.get("service_id")
+                sv["items"] = [{"product_id": sv.get("product_id"), "product_name": sv.get("product_name"), "model_no": sv.get("model_no"),
+                                "quantity": 1, "serial_numbers": [sv["serial_no"]] if sv.get("serial_no") else []}]
+                (dispatched_services if sv.get("dispatch") else pending_services).append(sv)
+        except Exception:
+            logging.error("completed services could not be added to the dispatch queue")
+
         dispatched_orders = [o for o in all_orders if o.get("dispatch")]
         dispatched_spare = [a for a in all_spare if a.get("dispatch")]
         dispatched_product_alloc = [a for a in all_product_alloc if a.get("dispatch")]
+
+        # Manufacturing date on the dispatch form = assembling date of each serial number.
+        # Serials that were never assembled in-house simply get no date.
+        assembly_dates = {}
+        try:
+            serial_nos = {sn for rec in (all_orders + all_product_alloc)
+                          for it in (rec.get("items") or []) for sn in (it.get("serial_numbers") or []) if sn}
+            if serial_nos:
+                for asm in assembly_manager().get_data(collection_name=ASSEMBLY_COLLECTION,
+                                                       query={"serials.serial_number": {"$in": list(serial_nos)}}):
+                    when = asm.get("completed_at") or asm.get("assembly_date") or asm.get("created_at")
+                    if not when:
+                        continue
+                    for s in asm.get("serials", []):
+                        if s.get("serial_number") in serial_nos:
+                            assembly_dates[s["serial_number"]] = when
+        except Exception:
+            logging.error("assembly dates for the dispatch form could not be fetched")
 
         logging.info("dispatch queue was fetched successfully")
         return {
@@ -2279,7 +2918,10 @@ def dispatch_queue(user: dict = Depends(require_role("service_manager", "admin",
             "pending_product_allocations": pending_product_alloc,
             "dispatched_orders": dispatched_orders,
             "dispatched_spare_parts": dispatched_spare,
-            "dispatched_product_allocations": dispatched_product_alloc
+            "dispatched_product_allocations": dispatched_product_alloc,
+            "pending_services": pending_services,
+            "dispatched_services": dispatched_services,
+            "assembly_dates": assembly_dates
         }
     except Exception as e:
         logging.error("dispatch queue could not be fetched")
@@ -2592,6 +3234,38 @@ def confirm_order_dispatch(order_id: str, request: DispatchConfirmRequest, user:
         raise HTTPException(status_code=500, detail="dispatch could not be confirmed")
 
 
+@app.post("/dispatch/confirm/service/{service_id}")
+def confirm_service_dispatch(service_id: str, request: DispatchConfirmRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
+    try:
+        db = service_detail(product_id="", serial_no="")
+        matches = db.get_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id}, projection={"image": 0, "video": 0})
+        if not matches:
+            raise HTTPException(status_code=404, detail="service not found")
+        if matches[0].get("status") != "completed":
+            raise HTTPException(status_code=400, detail="only a completed service can be dispatched")
+        dispatch_info = {
+            "docket_no": request.docket_no,
+            "invoice_no": request.invoice_no,
+            "invoice_date": request.invoice_date,
+            "mode_of_delivery": request.mode_of_delivery,
+            "dispatched_through": request.dispatched_through,
+            "ship_to_different": request.ship_to_different,
+            "ship_to_address": request.ship_to_address if request.ship_to_different else None,
+            "image": request.image,
+            "media_updated_at": datetime.now(timezone.utc).isoformat() if request.image else None,
+            "dispatched_by": user["username"],
+            "dispatched_at": datetime.now(timezone.utc).isoformat()
+        }
+        db.update_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id}, update_values={"dispatch": dispatch_info})
+        logging.info(f"service {service_id} dispatch confirmed")
+        return {"message": "dispatch confirmed", "service_id": service_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("service dispatch confirmation failed")
+        raise HTTPException(status_code=500, detail="dispatch could not be confirmed")
+
+
 @app.post("/dispatch/confirm/spare_part/{allocation_id}")
 def confirm_spare_part_dispatch(allocation_id: str, request: DispatchConfirmRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
     try:
@@ -2624,7 +3298,7 @@ def confirm_spare_part_dispatch(allocation_id: str, request: DispatchConfirmRequ
 def services(user: dict = Depends(get_current_user)):
     try:
         db = service_detail()
-        dataset = db.get_service_data(collection_name=SERVICE_COLLECTION, query={})
+        dataset = db.get_service_data(collection_name=SERVICE_COLLECTION, query={}, projection=SERVICE_LIST_PROJECTION)
         logging.info("service dataset was fetched successfully")
         return {"message": "service dataset", "dataset": dataset}
     except Exception as e:
@@ -2632,9 +3306,23 @@ def services(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail="service dataset cannot be fetched")
 
 
+def _check_field_address(location: str, address: str) -> str:
+    address = (address or "").strip()
+    if location == "outdoor" and not address:
+        raise HTTPException(status_code=400, detail="enter the address for a field service")
+    return address if location == "outdoor" else ""
+
+
+def _save_service_address(service_id: str, address: str):
+    if address:
+        service_detail().update_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id},
+                                     update_values={"address": address})
+
+
 @app.post("/services/create")
 def create_service(request: ServiceRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
     try:
+        address = _check_field_address(request.location, request.address)
         service = service_detail(product_id=request.product_id, serial_no=request.serial_no)
         service.add_service(
             collection_name=SERVICE_COLLECTION,
@@ -2645,9 +3333,17 @@ def create_service(request: ServiceRequest, user: dict = Depends(require_role("s
             technician_id=request.technician_id,
             location=request.location,
             spare_parts=request.spare_parts,
-            created_by=user["username"]
+            created_by=user["username"],
+            product_name=request.product_name,
+            model_no=request.model_no,
+            company_name=request.company_name
         )
+        _save_service_address(service.service_id, address)
         logging.info(f"service creation was successful with service_id {service.service_id}!")
+
+        _notify([request.technician_id], kind="service_assigned", title="New service assigned to you",
+                body=f"{request.product_name or request.product_id} (serial {request.serial_no}) - {request.issue}",
+                service_id=service.service_id, link=f"/pages/technician.html?service={service.service_id}")
 
         if request.video:
             _raise_media_review_request(service.service_id, user["username"])
@@ -2714,6 +3410,87 @@ def update_service(service_id: str, request: ServiceUpdateRequest, user: dict = 
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/service/edit/{service_id}")
+def edit_service(service_id: str, request: ServiceEditRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
+    """Edit the details of a service and/or reassign it to another technician."""
+    try:
+        db = service_detail(product_id="", serial_no="")
+        existing = db.get_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="service not found")
+        svc = existing[0]
+        changes = request.dict(exclude_unset=True)
+        if not changes:
+            raise HTTPException(status_code=400, detail="nothing to update")
+
+        update = {}
+        for key in ("company_name", "product_name", "model_no", "purchase_date", "spare_parts"):
+            if key in changes:
+                update[key] = (changes[key] or "").strip()
+        if "serial_no" in changes:
+            serial = (changes["serial_no"] or "").strip().lower()
+            if not serial:
+                raise HTTPException(status_code=400, detail="serial number cannot be empty")
+            update["serial_no"] = serial
+        if "issue" in changes:
+            issue = (changes["issue"] or "").strip()
+            if not issue:
+                raise HTTPException(status_code=400, detail="the issue cannot be empty")
+            update["issue"] = issue
+        if "service_charges" in changes:
+            charges = changes["service_charges"]
+            if charges is not None and charges < 0:
+                raise HTTPException(status_code=400, detail="service charges cannot be negative")
+            update["service_charges"] = charges
+
+        # location + address are validated together (a field service needs an address)
+        if "location" in changes or "address" in changes:
+            location = changes.get("location") or svc.get("location") or "indoor"
+            if location not in ("indoor", "outdoor"):
+                raise HTTPException(status_code=400, detail="location must be indoor or outdoor")
+            address = _check_field_address(location, changes.get("address", svc.get("address")))
+            update["location"] = location
+            update["address"] = address
+
+        # reassigning the technician
+        old_tech = svc.get("technician_alloted")
+        new_tech = None
+        if "technician_alloted" in changes:
+            new_tech = (changes["technician_alloted"] or "").strip()
+            if not new_tech:
+                raise HTTPException(status_code=400, detail="select a technician")
+            if new_tech != old_tech:
+                if svc.get("status") in ("completed", "rejected"):
+                    raise HTTPException(status_code=409, detail="a completed or rejected service cannot be reassigned")
+                person = mongodbclient().get_data(collection_name=ACCOUNTS_COLLECTION, query={"username": new_tech})
+                if not person:
+                    raise HTTPException(status_code=404, detail="that technician does not exist")
+                if person[0].get("role") == "admin":
+                    raise HTTPException(status_code=400, detail="a service cannot be assigned to an admin")
+                update["technician_alloted"] = new_tech
+            else:
+                new_tech = None
+
+        if not update:
+            raise HTTPException(status_code=400, detail="nothing to update")
+        db.update_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id}, update_values=update)
+
+        if new_tech:
+            label = f"{update.get('product_name') or svc.get('product_name') or svc.get('product_id') or 'Service'} (serial {update.get('serial_no') or svc.get('serial_no') or '-'})"
+            _notify([new_tech], kind="service_assigned", title="Service assigned to you",
+                    body=f"{label} - {update.get('issue') or svc.get('issue') or ''}",
+                    service_id=service_id, link=f"/pages/technician.html?service={service_id}")
+            _notify([old_tech], kind="service_reassigned", title="Service reassigned",
+                    body=f"{label} was reassigned to {new_tech} by {user['username']}", service_id=service_id)
+        logging.info(f"service {service_id} edited by {user['username']}: {sorted(update)}")
+        return {"message": "service was updated successfully", "service_id": service_id, "updated": sorted(update)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("service edit failed!")
+        raise HTTPException(status_code=500, detail="service could not be edited")
+
+
 @app.post("/service/request_status_update/{service_id}")
 def request_status_update(service_id: str, request: ServiceUpdateRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts", "technician", "distributor"))):
     try:
@@ -2741,7 +3518,7 @@ def request_status_update(service_id: str, request: ServiceUpdateRequest, user: 
 def my_services(user: dict = Depends(get_current_user)):
     try:
         db = service_detail()
-        dataset = db.get_service_data(collection_name=SERVICE_COLLECTION, query={"technician_alloted": user["username"]})
+        dataset = db.get_service_data(collection_name=SERVICE_COLLECTION, query={"technician_alloted": user["username"]}, projection=SERVICE_LIST_PROJECTION)
         logging.info(f"service dataset fetched for technician {user['username']}")
         return {"message": "my service dataset", "dataset": dataset}
     except Exception as e:
@@ -2805,6 +3582,46 @@ def manager_confirm(service_id: str, user: dict = Depends(require_role("service_
         raise HTTPException(status_code=500, detail="manager confirmation failed")
 
 
+class AddFaultyPartsRequest(BaseModel):
+    parts: list[dict] = []   # [{part_name, old_hologram_number}] - must be parts the technician reported on this service
+
+
+@app.post("/service/add_faulty/{service_id}")
+def add_faulty_parts(service_id: str, request: AddFaultyPartsRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
+    """Files the faulty (removed) part(s) of a service into the Damaged inventory right away: same name as the
+    part, the old hologram number as its id. The warranty of the lot it came from is carried over, exactly like
+    the automatic filing on completion (which skips anything already filed here)."""
+    try:
+        svc = service_detail()._get_one(SERVICE_COLLECTION, service_id)
+        reported = {(str(p.get("part_name") or "").strip().lower(), str(p.get("old_hologram_number") or "").strip()): p
+                    for p in (svc.get("faulty_parts") or [])}
+        if not request.parts:
+            raise HTTPException(status_code=400, detail="no faulty part selected")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        added, skipped = [], []
+        for item in request.parts:
+            name = str(item.get("part_name") or "").strip()
+            old = str(item.get("old_hologram_number") or "").strip()
+            if not old or (name.lower(), old) not in reported:
+                raise HTTPException(status_code=400, detail=f"{name or 'part'} / hologram {old or '-'} was not reported faulty on this service")
+            if _faulty_already_filed(name, old):
+                skipped.append(old)
+                continue
+            warranty_until = _damaged_part_warranty(old)
+            under_warranty = bool(warranty_until) and warranty_until >= today
+            reason = "" if under_warranty else f"damaged part removed during service {service_id}"
+            inventory_manager(product_name=name, product_id=old, quantity=1, product_type="damaged",
+                              warranty_until=warranty_until, reason=reason).add(collection_name=INVENTORY_COLLECTION)
+            added.append(old)
+        _record_faulty_filed(service_id, added + skipped)
+        return {"message": "faulty part(s) added to inventory" if added else "already in faulty inventory",
+                "added": added, "already_filed": skipped, "service_id": service_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _flow_http_error(e, "faulty part could not be added to inventory")
+
+
 @app.post("/service/extend_warranty/{service_id}")
 def extend_warranty(service_id: str, request: ExtendWarrantyRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
     try:
@@ -2814,6 +3631,543 @@ def extend_warranty(service_id: str, request: ExtendWarrantyRequest, user: dict 
     except Exception as e:
         logging.error("warranty extension failed!")
         raise HTTPException(status_code=500, detail="warranty extension failed")
+
+
+# ---------------------------------------------------------------------------
+# In-app notifications (bell icon) - e.g. "New service assigned to you"
+# ---------------------------------------------------------------------------
+def _notify(usernames, kind: str, title: str, body: str = "", link: str = "", service_id: str = ""):
+    """Never raises: a notification problem must not break the action that caused it."""
+    try:
+        db = mongodbclient()
+        now = datetime.now(timezone.utc).isoformat()
+        for name in {u for u in usernames if u}:
+            db.add(collection_name=NOTIFICATIONS_COLLECTION, dictionary={
+                "notification_id": str(uuid.uuid4()), "username": name, "kind": kind,
+                "title": title, "body": body, "link": link, "service_id": service_id,
+                "read": False, "created_at": now})
+    except Exception:
+        logging.error("notification could not be saved")
+
+
+def _service_reviewers(created_by: str = None) -> list:
+    names = set()
+    try:
+        for row in mongodbclient().get_data(collection_name=ACCOUNTS_COLLECTION, query={"role": "service_manager"}):
+            names.add(row.get("username"))
+    except Exception:
+        logging.error("service managers could not be listed for notification")
+    if created_by:
+        names.add(created_by)
+    return [n for n in names if n]
+
+
+@app.get("/notification/mine")
+def my_notifications(user: dict = Depends(get_current_user)):
+    try:
+        run_in_background("service_reminders", send_service_reminders, 1800)
+        rows = mongodbclient().get_data(collection_name=NOTIFICATIONS_COLLECTION, query={"username": user["username"]})
+        rows = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)[:30]
+        return {"message": "my notifications", "dataset": rows}
+    except Exception:
+        logging.error("notifications cannot be fetched")
+        raise HTTPException(status_code=500, detail="notifications cannot be fetched")
+
+
+@app.post("/notification/read/{notification_id}")
+def read_notification(notification_id: str, user: dict = Depends(get_current_user)):
+    try:
+        mongodbclient().update_data(collection_name=NOTIFICATIONS_COLLECTION,
+                                    query={"notification_id": notification_id, "username": user["username"]},
+                                    update_values={"read": True})
+        return {"message": "marked as read"}
+    except Exception:
+        logging.error("notification could not be marked read")
+        raise HTTPException(status_code=500, detail="notification cannot be updated")
+
+
+@app.post("/notification/read_all")
+def read_all_notifications(user: dict = Depends(get_current_user)):
+    try:
+        mongodbclient().update_data(collection_name=NOTIFICATIONS_COLLECTION,
+                                    query={"username": user["username"], "read": False},
+                                    update_values={"read": True}, many=True)
+        return {"message": "all marked as read"}
+    except Exception:
+        logging.error("notifications could not be marked read")
+        raise HTTPException(status_code=500, detail="notifications cannot be updated")
+
+
+# ---------------------------------------------------------------------------
+# Technician service workflow
+#   start (damaged product image + serial) -> spare part decision -> service report
+#   -> pending_approval -> service manager approves the faulty part return -> completed
+# ---------------------------------------------------------------------------
+def _flow_http_error(e: Exception, fallback: str):
+    if isinstance(e, ServiceFlowError):
+        return HTTPException(status_code=e.status_code, detail=str(e))
+    logging.error(fallback)
+    return HTTPException(status_code=500, detail=fallback)
+
+
+@app.post("/service/start/{service_id}")
+def flow_start(service_id: str, request: ServiceStartRequest, user: dict = Depends(require_role("technician", "distributor"))):
+    try:
+        mismatch = service_detail().start_service(SERVICE_COLLECTION, service_id, user["username"],
+                                                  request.damage_image, request.serial_no)
+        return {"message": "service started", "service_id": service_id, "serial_mismatch": mismatch}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _flow_http_error(e, "service could not be started")
+
+
+@app.post("/service/spare_decision/{service_id}")
+def flow_spare_decision(service_id: str, request: SpareDecisionRequest, user: dict = Depends(require_role("technician", "distributor"))):
+    try:
+        db = service_detail()
+        before = db._get_one(SERVICE_COLLECTION, service_id)
+        parts = db.save_spare_decision(SERVICE_COLLECTION, service_id, user["username"], request.spare_needed,
+                                       [p.dict() for p in request.parts])
+        if request.spare_needed:
+            note = "; ".join(f"{p['part_name']} (old hologram {p['old_hologram_number']})" for p in parts)
+            if note != (before.get("spare_parts_requested") or ""):
+                # same request the old "Request Spare Part" button raised, so the service manager can allocate the part
+                db.request_spare_part(collection_name=SERVICE_COLLECTION, query={"service_id": service_id}, note=note)
+                req = request_manager(request_type="spare_part", raised_by=user["username"],
+                                      details={"service_id": service_id, "note": note,
+                                               "parts": [{"part_name": p["part_name"],
+                                                          "old_hologram_number": p.get("old_hologram_number", "")} for p in parts]})
+                req.add(collection_name=REQUESTS_COLLECTION)
+                _notify(_service_reviewers(), kind="spare_part_request", title="Spare part request",
+                        body=f"{user['username']} needs: {note}", service_id=service_id,
+                        link="/pages/service.html?tab=requests")
+        return {"message": "spare part decision saved", "service_id": service_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _flow_http_error(e, "spare part decision could not be saved")
+
+
+@app.post("/service/submit_report/{service_id}")
+def flow_submit_report(service_id: str, request: ServiceReportRequest, user: dict = Depends(require_role("technician", "distributor"))):
+    try:
+        db = service_detail()
+        svc = db.submit_report(SERVICE_COLLECTION, service_id, user["username"], request.work_done,
+                               {p.old_hologram_number: p.new_hologram_number for p in request.parts}, request.final_image)
+        _notify(_service_reviewers(svc.get("created_by")), kind="service_report", title="Service report waiting for approval",
+                body=f"{user['username']} submitted the report for {svc.get('product_name') or svc.get('product_id')} "
+                     f"(serial {svc.get('serial_no')}). Approve once the faulty part is returned.",
+                service_id=service_id, link=f"/pages/service.html?review={service_id}")
+        return {"message": "report sent for approval", "service_id": service_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _flow_http_error(e, "service report could not be submitted")
+
+
+@app.post("/service/approve_completion/{service_id}")
+def flow_approve(service_id: str, request: ServiceApproveRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
+    try:
+        db = service_detail()
+        svc = db._get_one(SERVICE_COLLECTION, service_id)
+        if svc.get("status") != "pending_approval":
+            raise ServiceFlowError("only a service whose report is waiting for approval can be approved", 409)
+        charges = request.service_charges if request.service_charges is not None else svc.get("service_charges")
+        if charges is None or float(charges) < 0:
+            raise ServiceFlowError("enter the service charges before approving")
+
+        # faulty part(s) go into the Damaged inventory and the assembly hologram rolls forward
+        hologram_mismatch = False
+        parts = db.pending_parts_for_swap(svc)
+        if parts:
+            hologram_mismatch = _swap_faulty_part(service_id, parts)
+        db.approve_completion(SERVICE_COLLECTION, service_id, user["username"], request.service_charges)
+
+        _notify([svc.get("technician_alloted")], kind="service_completed", title="Service completed",
+                body=f"{svc.get('product_name') or svc.get('product_id')} (serial {svc.get('serial_no')}) was approved by {user['username']}.",
+                service_id=service_id, link=f"/pages/technician.html?service={service_id}")
+        return {"message": "service approved and completed", "service_id": service_id, "hologram_mismatch": hologram_mismatch}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _flow_http_error(e, "service could not be approved")
+
+
+@app.post("/service/send_back/{service_id}")
+def flow_send_back(service_id: str, request: ServiceSendBackRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
+    try:
+        db = service_detail()
+        svc = db.reject_report(SERVICE_COLLECTION, service_id, request.reason)
+        _notify([svc.get("technician_alloted")], kind="service_sent_back", title="Service report sent back",
+                body=f"{user['username']}: {request.reason.strip()}",
+                service_id=service_id, link=f"/pages/technician.html?service={service_id}")
+        return {"message": "report sent back to the technician", "service_id": service_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _flow_http_error(e, "report could not be sent back")
+
+
+def _file_reschedule_request(kind: str, target_id: str, label: str, when: str, note: str, current, user: dict) -> str:
+    db = request_manager()
+    pending = db.get_data(collection_name=REQUESTS_COLLECTION,
+                          query={"request_type": "reschedule", "status": "pending", "details.target_id": target_id})
+    if pending:
+        raise HTTPException(status_code=409, detail="a reschedule request for this is already waiting for approval")
+    req = request_manager(request_type="reschedule", raised_by=user["username"], details={
+        "kind": kind, "target_id": target_id, "label": label, "requested_date": when,
+        "current_date": current, "reason": (note or "").strip()})
+    req.add(collection_name=REQUESTS_COLLECTION)
+    _notify(_service_reviewers(), kind="reschedule_request", title="Reschedule request",
+            body=f"{user['username']}: {label} -> {when}" + (f" - {note.strip()}" if note and note.strip() else ""),
+            service_id=target_id, link="/pages/service.html?tab=requests")
+    return req.request_id
+
+
+def _apply_installation_schedule(inst: dict, when: str, note: str, by: str):
+    now = datetime.now(timezone.utc).isoformat()
+    history = list(inst.get("schedule_history") or []) + [
+        {"from": inst.get("scheduled_date"), "to": when, "note": (note or "").strip(), "by": by, "at": now}]
+    mongodbclient().update_data(collection_name=INSTALLATION_COLLECTION, query={"installation_id": inst["installation_id"]},
+                                update_values={"technician_id": inst.get("technician_id"), "scheduled_date": when,
+                                               "schedule_history": history, "last_reminder_at": now,
+                                               "status": "scheduled" if inst.get("status") == "requested" else inst.get("status")})
+
+
+def _apply_reschedule_request(details: dict, raised_by: str):
+    kind, target, when, reason = details.get("kind"), details.get("target_id"), details.get("requested_date"), details.get("reason", "")
+    if kind == "service":
+        service_detail().reschedule_service(SERVICE_COLLECTION, target, when, reason, raised_by)
+    elif kind == "installation":
+        inst = _get_installation(target)
+        if inst.get("status") == "completed":
+            raise HTTPException(status_code=409, detail="a completed installation cannot be rescheduled")
+        _apply_installation_schedule(inst, _valid_schedule(when), reason, raised_by)
+    else:
+        raise HTTPException(status_code=400, detail="unknown reschedule request")
+
+
+@app.post("/service/reschedule/{service_id}")
+def flow_reschedule(service_id: str, request: ServiceRescheduleRequest,
+                    user: dict = Depends(require_role("technician", "distributor", "service_manager", "admin", "accounts"))):
+    try:
+        db = service_detail()
+        existing = db.get_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="service not found")
+        svc = existing[0]
+        tech = svc.get("technician_alloted")
+        if user["role"] in ("technician", "distributor") and tech != user["username"]:
+            raise HTTPException(status_code=403, detail="this service is not assigned to you")
+        when = _valid_schedule(request.scheduled_date)
+        if user["role"] in ("technician", "distributor"):
+            if svc.get("status") in ("completed", "rejected"):
+                raise HTTPException(status_code=409, detail="this service can no longer be rescheduled")
+            label = f"{svc.get('product_name') or svc.get('product_id') or 'Service'} (serial {svc.get('serial_no') or '-'})"
+            request_id = _file_reschedule_request("service", service_id, label, when, request.reason, svc.get("scheduled_date"), user)
+            return {"message": "reschedule request sent for approval", "pending_approval": True, "request_id": request_id}
+        db.reschedule_service(SERVICE_COLLECTION, service_id, when, request.reason, user["username"])
+        body = f"{when}" + (f" - {request.reason.strip()}" if request.reason.strip() else "")
+        _notify([tech], kind="service_rescheduled", title="Service rescheduled",
+                body=f"{user['username']}: {body}", service_id=service_id, link=f"/pages/technician.html?service={service_id}")
+        return {"message": "service rescheduled", "service_id": service_id, "scheduled_date": when}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _flow_http_error(e, "service could not be rescheduled")
+
+
+@app.get("/allocation/technician")
+def technician_allocations(user: dict = Depends(get_current_user)):
+    """Demo units held by this technician + spare parts allocated against their services."""
+    try:
+        db = mongodbclient()
+        demo = db.get_data(collection_name=ALLOCATION_COLLECTION,
+                           query={"allocation_type": {"$in": ["demo_unit", "product"]}, "allocated_by": user["username"]},
+                           projection={"damage_report.image": 0, "dispatch.image": 0})
+        my_ids = [s.get("service_id") for s in db.get_data(
+            collection_name=SERVICE_COLLECTION, query={"technician_alloted": user["username"]},
+            projection={"service_id": 1}) if s.get("service_id")]
+        parts = []
+        if my_ids:
+            parts = db.get_data(collection_name=ALLOCATION_COLLECTION,
+                                query={"allocation_type": "spare_part", "spare_part.service_id": {"$in": my_ids}},
+                                projection={"damage_report.image": 0, "dispatch.image": 0})
+        for rows in (demo, parts):
+            for r in rows:
+                r.pop("_id", None)
+        return {"message": "technician allocations", "demo_units": demo, "spare_parts": parts}
+    except Exception:
+        logging.error("technician allocations cannot be fetched")
+        raise HTTPException(status_code=500, detail="technician allocations cannot be fetched")
+
+
+# ---------------------------------------------------------------------------
+# Installations: product installation requests that a technician can schedule
+# ---------------------------------------------------------------------------
+INSTALLATION_STATUSES = ("requested", "scheduled", "in_progress", "pending_approval", "completed")
+INSTALLATION_MANAGERS = ("service_manager", "admin", "accounts")
+
+
+def _clean(row: dict) -> dict:
+    row.pop("_id", None)
+    return row
+
+
+def _clean_list(row: dict) -> dict:
+    """List responses never carry the heavy base64 photo; fetch it via /installation/media/{id}."""
+    row = _clean(row)
+    row["has_completion_image"] = bool(row.pop("completion_image", None))
+    return row
+
+
+def _get_installation(installation_id: str) -> dict:
+    rows = mongodbclient().get_data(collection_name=INSTALLATION_COLLECTION, query={"installation_id": installation_id})
+    if not rows:
+        raise HTTPException(status_code=404, detail="installation not found")
+    return rows[0]
+
+
+def _check_install_access(inst: dict, user: dict):
+    if user["role"] in INSTALLATION_MANAGERS:
+        return
+    if inst.get("technician_id") != user["username"]:
+        raise HTTPException(status_code=403, detail="this installation is not assigned to you")
+
+
+def _valid_schedule(value: str) -> str:
+    try:
+        datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="enter a valid date and time")
+    return str(value)
+
+
+@app.post("/installation/create")
+def create_installation(request: InstallationCreateRequest,
+                        user: dict = Depends(require_role("technician", "distributor", "service_manager", "admin", "accounts", "sales"))):
+    try:
+        if not request.product_name.strip() or not request.company_name.strip():
+            raise HTTPException(status_code=400, detail="product name and customer are required")
+        now = datetime.now(timezone.utc).isoformat()
+        tech = request.technician_id.strip()
+        if user["role"] in ("technician", "distributor") and not tech:
+            tech = user["username"]
+        installation_id = str(uuid.uuid4())
+        doc = {
+            "installation_id": installation_id, "product_name": request.product_name.strip(),
+            "model_no": request.model_no.strip(), "serial_no": request.serial_no.strip(),
+            "company_name": request.company_name.strip(), "address": request.address.strip(),
+            "contact_person": request.contact_person.strip(), "contact_number": request.contact_number.strip(),
+            "technician_id": tech or None, "preferred_date": request.preferred_date, "notes": request.notes.strip(),
+            "status": "requested", "scheduled_date": None, "schedule_history": [], "history": [],
+            "requested_by": user["username"], "created_at": now, "last_reminder_at": None,
+        }
+        mongodbclient().add(collection_name=INSTALLATION_COLLECTION, dictionary=doc)
+        _notify([tech] if tech else _service_reviewers(), kind="installation_requested", title="New installation request",
+                body=f"{doc['product_name']} - {doc['company_name']}", service_id=installation_id,
+                link=f"/pages/technician.html?installation={installation_id}")
+        return {"message": "installation requested", "installation_id": installation_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("installation could not be created")
+        raise HTTPException(status_code=500, detail="installation could not be created")
+
+
+@app.get("/installation/")
+def list_installations(user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
+    try:
+        rows = mongodbclient().get_data(collection_name=INSTALLATION_COLLECTION, query={})
+        rows = sorted((_clean_list(r) for r in rows), key=lambda r: r.get("created_at") or "", reverse=True)
+        return {"message": "installations", "dataset": rows}
+    except Exception:
+        logging.error("installations cannot be fetched")
+        raise HTTPException(status_code=500, detail="installations cannot be fetched")
+
+
+@app.get("/installation/mine")
+def my_installations(user: dict = Depends(get_current_user)):
+    """Installations assigned to me, plus unassigned requests (so any technician can pick them up)."""
+    try:
+        rows = mongodbclient().get_data(collection_name=INSTALLATION_COLLECTION, query={
+            "$or": [{"technician_id": user["username"]}, {"technician_id": None}, {"technician_id": ""}]})
+        rows = sorted((_clean_list(r) for r in rows), key=lambda r: r.get("created_at") or "", reverse=True)
+        return {"message": "my installations", "dataset": rows}
+    except Exception:
+        logging.error("my installations cannot be fetched")
+        raise HTTPException(status_code=500, detail="installations cannot be fetched")
+
+
+@app.get("/installation/media/{installation_id}")
+def installation_media(installation_id: str, user: dict = Depends(get_current_user)):
+    try:
+        inst = _get_installation(installation_id)
+        _check_install_access(inst, user)
+        return {"installation_id": installation_id, "completion_image": inst.get("completion_image") or "",
+                "completion_note": inst.get("completion_note") or ""}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("installation media cannot be fetched")
+        raise HTTPException(status_code=500, detail="installation media cannot be fetched")
+
+
+@app.post("/installation/assign/{installation_id}")
+def assign_installation(installation_id: str, request: InstallationAssignRequest,
+                        user: dict = Depends(require_role("technician", "distributor", "service_manager", "admin", "accounts"))):
+    try:
+        inst = _get_installation(installation_id)
+        # a technician may only take an unassigned request (or hand over their own)
+        if user["role"] in ("technician", "distributor") and inst.get("technician_id") not in (None, "", user["username"]):
+            raise HTTPException(status_code=403, detail="this installation is assigned to someone else")
+        tech = request.technician_id.strip()
+        if not tech:
+            raise HTTPException(status_code=400, detail="select a technician")
+        mongodbclient().update_data(collection_name=INSTALLATION_COLLECTION, query={"installation_id": installation_id},
+                                    update_values={"technician_id": tech, "last_reminder_at": datetime.now(timezone.utc).isoformat()})
+        _notify([tech], kind="installation_assigned", title="Installation assigned to you",
+                body=f"{inst.get('product_name')} - {inst.get('company_name')}", service_id=installation_id,
+                link=f"/pages/technician.html?installation={installation_id}")
+        return {"message": "installation assigned", "installation_id": installation_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("installation could not be assigned")
+        raise HTTPException(status_code=500, detail="installation could not be assigned")
+
+
+@app.post("/installation/schedule/{installation_id}")
+def schedule_installation(installation_id: str, request: InstallationScheduleRequest,
+                          user: dict = Depends(require_role("technician", "distributor", "service_manager", "admin", "accounts"))):
+    try:
+        inst = _get_installation(installation_id)
+        is_tech = user["role"] in ("technician", "distributor")
+        if is_tech and not inst.get("technician_id"):
+            inst["technician_id"] = user["username"]
+        _check_install_access(inst, user)
+        if inst.get("status") == "completed":
+            raise HTTPException(status_code=409, detail="a completed installation cannot be rescheduled")
+        when = _valid_schedule(request.scheduled_date)
+        if is_tech and inst.get("scheduled_date"):
+            label = f"Installation: {inst.get('product_name')} - {inst.get('company_name')}"
+            request_id = _file_reschedule_request("installation", installation_id, label, when, request.note, inst.get("scheduled_date"), user)
+            return {"message": "reschedule request sent for approval", "pending_approval": True, "request_id": request_id}
+        _apply_installation_schedule(inst, when, request.note, user["username"])
+        notify_to = _service_reviewers() if user["username"] == inst.get("technician_id") else [inst.get("technician_id")]
+        _notify(notify_to, kind="installation_scheduled", title="Installation scheduled",
+                body=f"{inst.get('product_name')} - {inst.get('company_name')} on {when}", service_id=installation_id,
+                link=f"/pages/technician.html?installation={installation_id}")
+        return {"message": "installation scheduled", "installation_id": installation_id, "scheduled_date": when}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("installation could not be scheduled")
+        raise HTTPException(status_code=500, detail="installation could not be scheduled")
+
+
+@app.post("/installation/status/{installation_id}")
+def installation_status(installation_id: str, request: InstallationStatusRequest,
+                        user: dict = Depends(require_role("technician", "distributor", "service_manager", "admin", "accounts"))):
+    try:
+        if request.status not in INSTALLATION_STATUSES:
+            raise HTTPException(status_code=400, detail="invalid status")
+        inst = _get_installation(installation_id)
+        _check_install_access(inst, user)
+        if request.status in ("in_progress", "pending_approval", "completed") and not inst.get("technician_id"):
+            raise HTTPException(status_code=409, detail="assign a technician first")
+        now = datetime.now(timezone.utc).isoformat()
+        history = list(inst.get("history") or []) + [
+            {"status": request.status, "note": request.note.strip(), "by": user["username"], "at": now}]
+        update = {"status": request.status, "history": history}
+        if request.status == "pending_approval":
+            if not request.image or not request.image.startswith("data:image/"):
+                raise HTTPException(status_code=400, detail="completion photo is required")
+            update["completion_image"] = request.image
+            update["completion_note"] = request.note.strip()
+        if request.status == "completed":
+            update["completed_at"] = now
+        mongodbclient().update_data(collection_name=INSTALLATION_COLLECTION, query={"installation_id": installation_id},
+                                    update_values=update)
+        if user["username"] == inst.get("technician_id"):
+            _notify(_service_reviewers(), kind="installation_status", title=f"Installation {request.status.replace('_', ' ')}",
+                    body=f"{inst.get('product_name')} - {inst.get('company_name')}", service_id=installation_id,
+                    link=f"/pages/service.html?installation={installation_id}")
+        return {"message": "installation updated", "installation_id": installation_id, "status": request.status}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("installation status could not be updated")
+        raise HTTPException(status_code=500, detail="installation status could not be updated")
+
+
+# ---------------------------------------------------------------------------
+# 24h reminders for every service / installation that is not completed
+# ---------------------------------------------------------------------------
+REMINDER_HOURS = 24
+
+
+def send_service_reminders():
+    """Never raises. Each pending item notifies its owner once per REMINDER_HOURS until completed."""
+    try:
+        db = service_detail(product_id="", serial_no="")
+        for svc in db.services_due_for_reminder(SERVICE_COLLECTION, REMINDER_HOURS):
+            sid = svc.get("service_id")
+            tech = svc.get("technician_alloted")
+            label = f"{svc.get('product_name') or svc.get('product_id') or 'Service'} ({svc.get('company_name') or sid})"
+            if svc.get("status") == "pending_approval" or not tech:
+                who, link = _service_reviewers(), f"/pages/service.html?service={sid}"
+                title = "Service waiting for your review" if tech else "Service not assigned yet"
+            else:
+                who, link = [tech], f"/pages/technician.html?service={sid}"
+                title = "Reminder: service not completed"
+            _notify(who, kind="service_reminder", title=title, body=f"{label} is still {svc.get('status')}",
+                    service_id=sid, link=link)
+            db.mark_reminded(SERVICE_COLLECTION, sid)
+    except Exception as e:
+        logging.error(f"service reminders failed: {e}")
+    try:
+        mdb = mongodbclient()
+        limit = datetime.now(timezone.utc) - timedelta(hours=REMINDER_HOURS)
+        for inst in mdb.get_data(collection_name=INSTALLATION_COLLECTION, query={"status": {"$ne": "completed"}}):
+            raw = inst.get("last_reminder_at") or inst.get("created_at")
+            try:
+                last = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+            except Exception:
+                last = None
+            if last is not None and last > limit:
+                continue
+            iid, tech = inst.get("installation_id"), inst.get("technician_id")
+            _notify([tech] if tech else _service_reviewers(), kind="installation_reminder",
+                    title="Reminder: installation not completed",
+                    body=f"{inst.get('product_name')} - {inst.get('company_name')} is still {inst.get('status')}",
+                    service_id=iid, link=f"/pages/technician.html?installation={iid}")
+            mdb.update_data(collection_name=INSTALLATION_COLLECTION, query={"installation_id": iid},
+                            update_values={"last_reminder_at": datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        logging.error(f"installation reminders failed: {e}")
+
+
+def _reminder_loop():
+    while True:
+        send_service_reminders()
+        time.sleep(1800)
+
+
+@app.get("/service/media/{service_id}")
+def flow_media(service_id: str, user: dict = Depends(require_role("service_manager", "admin", "accounts", "technician", "distributor"))):
+    try:
+        media = service_detail().get_media(SERVICE_COLLECTION, service_id)
+        if user["role"] in ("technician", "distributor") and media["technician_alloted"] != user["username"]:
+            raise HTTPException(status_code=403, detail="this service is not assigned to you")
+        return media
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _flow_http_error(e, "service images cannot be fetched")
 
 
 @app.get("/inventory/")
@@ -2860,7 +4214,7 @@ def inventory(user: dict = Depends(get_current_user)):
 
 
 @app.get("/inventory/detail")
-def inventory_detail(product_id: str = "", model_no: str = "", product_type: str = "",
+def inventory_detail(product_id: str = "", model_no: str = "", product_type: str = "", lot_id: str = "",
                       user: dict = Depends(get_current_user)):
     """
     Fresh, full copy of one lot — including serial_numbers/hologram_numbers,
@@ -2884,6 +4238,13 @@ def inventory_detail(product_id: str = "", model_no: str = "", product_type: str
             query["product_type"] = {"$in": ["product", None]}
         elif product_type:
             query["product_type"] = product_type
+        # parts (spare/service) have no product_id, so product_id+model_no+type is not unique —
+        # when the caller knows the exact lot, fetch that one
+        if lot_id:
+            try:
+                query = {"_id": ObjectId(lot_id)}
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid lot id")
         db = inventory_manager()
         docs = db.get_data(collection_name=INVENTORY_COLLECTION, query=query)
         if not docs:
@@ -2916,6 +4277,21 @@ def inventory_detail(product_id: str = "", model_no: str = "", product_type: str
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _record_for_view(doc):
+    """JSON-safe copy of a stored record for the Record page's detail view: drops Mongo _id,
+    turns ObjectId / datetime etc. into strings and replaces huge strings (e.g. embedded
+    images) with a short placeholder so the response stays small."""
+    if isinstance(doc, dict):
+        return {str(k): _record_for_view(v) for k, v in doc.items() if k != "_id"}
+    if isinstance(doc, (list, tuple, set)):
+        return [_record_for_view(v) for v in doc]
+    if isinstance(doc, str):
+        return doc if len(doc) <= 1000 else "[long value omitted]"
+    if doc is None or isinstance(doc, (bool, int, float)):
+        return doc
+    return str(doc)
+
+
 @app.get("/inventory/serial_history/{serial_number}")
 def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
     """
@@ -2937,11 +4313,34 @@ def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
         if not serial_number:
             raise HTTPException(status_code=400, detail="serial number is required")
 
+        # Stored serials are not consistently lowercase (assembly serials are
+        # upper-case, imported/typed ones vary, some carry stray spaces), so an
+        # exact lowercase match missed many of them. Match case-insensitively
+        # and ignore surrounding whitespace in every collection, and compare
+        # the same way in Python below.
+        rx = {"$regex": r"^\s*" + re.escape(serial_number) + r"\s*$", "$options": "i"}
+
+        def _same(v):
+            return str(v or "").strip().lower() == serial_number
+
+        def _has(lst):
+            return any(_same(x) for x in (lst or []))
+
         events = []
+
+        # Every event also carries "full" = the whole underlying record (order, allocation, service ...)
+        # so the Record page can open it when an event is clicked. Full records hold prices and customer
+        # data, so they are only sent to roles that already manage those pages; everyone else keeps
+        # getting just the short "details" summary.
+        _can_see_full = user.get("role") in ("admin", "accounts", "inventory_manager") or bool(
+            _borrowed_roles(user["username"]) & {"accounts", "inventory_manager"})
+
+        def _full(doc):
+            return _record_for_view(doc) if _can_see_full else None
 
         # ---- Currently in inventory (and under which category) ----
         inv_db = inventory_manager()
-        inv_entries = inv_db.get_data(collection_name=INVENTORY_COLLECTION, query={"serial_numbers": serial_number})
+        inv_entries = inv_db.get_data(collection_name=INVENTORY_COLLECTION, query={"serial_numbers": rx})
         for entry in inv_entries:
             events.append({
                 "type": "inventory",
@@ -2955,14 +4354,15 @@ def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
                     "lot_no": entry.get("lot_no"),
                     "product_type": entry.get("product_type"),
                     "reason": entry.get("reason") or None,
-                }
+                },
+                "full": _full(entry),
             })
 
         # ---- Assembly (when/how this unit was built, if it was assembled in-house) ----
         asm_db = assembly_manager()
-        assemblies = asm_db.get_data(collection_name=ASSEMBLY_COLLECTION, query={"serials.serial_number": serial_number})
+        assemblies = asm_db.get_data(collection_name=ASSEMBLY_COLLECTION, query={"serials.serial_number": rx})
         for asm in assemblies:
-            serial_entry = next((s for s in asm.get("serials", []) if s.get("serial_number") == serial_number), {})
+            serial_entry = next((s for s in asm.get("serials", []) if _same(s.get("serial_number"))), {})
             events.append({
                 "type": "assembly",
                 "label": "Assembled",
@@ -2972,14 +4372,15 @@ def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
                     "product_name": asm.get("product_name"),
                     "hologram_number": serial_entry.get("hologram_number"),
                     "status": asm.get("status"),
-                }
+                },
+                "full": _full(asm),
             })
 
         # ---- Orders (sale + any return) ----
         order_db = order_manager()
-        orders = order_db.get_data(collection_name=ORDERS_COLLECTION, query={"items.serial_numbers": serial_number})
+        orders = order_db.get_data(collection_name=ORDERS_COLLECTION, query={"items.serial_numbers": rx})
         for o in orders:
-            item = next((it for it in o.get("items", []) if serial_number in (it.get("serial_numbers") or [])), {})
+            item = next((it for it in o.get("items", []) if _has(it.get("serial_numbers"))), {})
             events.append({
                 "type": "order",
                 "label": "Sold via order",
@@ -2989,10 +4390,11 @@ def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
                     "product_name": item.get("product_name"),
                     "company_name": (o.get("customer") or {}).get("company_name"),
                     "status": o.get("status"),
-                }
+                },
+                "full": _full(o),
             })
             if o.get("status") == "returned":
-                ret_item = next((r for r in (o.get("returned_items") or []) if serial_number in (r.get("serial_numbers") or [])), None)
+                ret_item = next((r for r in (o.get("returned_items") or []) if _has(r.get("serial_numbers"))), None)
                 events.append({
                     "type": "order_return",
                     "label": "Returned (order)",
@@ -3001,14 +4403,15 @@ def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
                         "order_id": o.get("order_id"),
                         "reason": o.get("return_reason"),
                         "condition": ret_item.get("condition") if ret_item else None,
-                    }
+                    },
+                    "full": _full(o),
                 })
 
         # ---- Allocations (demo unit or sales-person product allocation + return/damage) ----
         alloc_db = allocation_manager()
-        allocations = alloc_db.get_data(collection_name=ALLOCATION_COLLECTION, query={"items.serial_numbers": serial_number})
+        allocations = alloc_db.get_data(collection_name=ALLOCATION_COLLECTION, query={"items.serial_numbers": rx})
         for a in allocations:
-            item = next((it for it in a.get("items", []) if serial_number in (it.get("serial_numbers") or [])), {})
+            item = next((it for it in a.get("items", []) if _has(it.get("serial_numbers"))), {})
             is_demo = a.get("allocation_type") == "demo_unit"
             events.append({
                 "type": "allocation",
@@ -3020,7 +4423,8 @@ def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
                     "to": (a.get("customer") or {}).get("company_name") if is_demo else (a.get("sales_person") or {}).get("name"),
                     "allocated_by": a.get("allocated_by"),
                     "return_status": a.get("return_status"),
-                }
+                },
+                "full": _full(a),
             })
             if a.get("return_status") == "returned":
                 damage = a.get("damage_report") or {}
@@ -3033,12 +4437,16 @@ def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
                         "returned_by": a.get("returned_by"),
                         "faulty": bool(damage.get("reported")),
                         "issue": damage.get("issue"),
-                    }
+                    },
+                    "full": _full(a),
                 })
 
         # ---- Service records raised against this serial ----
         svc_db = service_detail(product_id="", serial_no="")
-        services = svc_db.get_service_data(collection_name=SERVICE_COLLECTION, query={"serial_no": serial_number})
+        try:
+            services = svc_db.get_service_data(collection_name=SERVICE_COLLECTION, query={"serial_no": rx})
+        except Exception:
+            services = svc_db.get_service_data(collection_name=SERVICE_COLLECTION, query={"serial_no": serial_number})
         for s in services:
             events.append({
                 "type": "service",
@@ -3049,7 +4457,8 @@ def serial_history(serial_number: str, user: dict = Depends(get_current_user)):
                     "issue": s.get("issue"),
                     "status": s.get("service_status"),
                     "technician_id": s.get("technician_id"),
-                }
+                },
+                "full": _full(s),
             })
 
         # dates can come back as plain "YYYY-MM-DD" strings from some
@@ -3089,18 +4498,322 @@ def available_serials(product_id: str, model_no: str = "", user: dict = Depends(
     """
     try:
         db = inventory_manager()
-        serials = db.list_available_serials(INVENTORY_COLLECTION, product_id, model_no=model_no or None)
+        serials = _unsold_serials(db.list_available_serials(INVENTORY_COLLECTION, product_id, model_no=model_no or None))
         return {"message": "available serial numbers", "serial_numbers": serials}
     except Exception as e:
         logging.error("fetching available serial numbers failed!")
         raise HTTPException(status_code=500, detail="available serial numbers cannot be fetched")
 
 
+@app.get("/inventory/serial_search")
+def serial_search(q: str, limit: int = 10, user: dict = Depends(require_role("admin", "accounts", "service_manager"))):
+    term = (q or "").strip()
+    if len(term) < 3:
+        return {"results": []}
+    limit = max(1, min(int(limit or 10), 25))
+    try:
+        needle = term.lower()
+        lots = inventory_manager().get_data(
+            collection_name=INVENTORY_COLLECTION,
+            query={"serial_numbers": {"$regex": re.escape(term), "$options": "i"},
+                   "quantity": {"$gt": 0},
+                   "product_type": {"$nin": ["damaged", "spare_parts", "service_parts"]}})
+        lots.sort(key=lambda e: e.get("purchase_date") or "")
+        found, seen = [], set()
+        for lot in lots:
+            for sn in (lot.get("serial_numbers") or []):
+                if needle in str(sn).lower() and sn not in seen:
+                    seen.add(sn)
+                    found.append({"serial_number": sn, "product_id": lot.get("product_id"),
+                                  "product_name": lot.get("product_name"), "model_no": lot.get("model_no") or "",
+                                  "price": lot.get("price") or 0, "tax_rate": lot.get("tax_rate") or 0,
+                                  "lot_no": lot.get("lot_no") or ""})
+        found.sort(key=lambda r: (0 if str(r["serial_number"]).lower() == needle else 1, str(r["serial_number"])))
+        found = found[:limit * 3]
+        free = set(_unsold_serials([r["serial_number"] for r in found]))
+        return {"results": [r for r in found if r["serial_number"] in free][:limit]}
+    except Exception as e:
+        logging.error(f"serial search failed: {e}")
+        raise HTTPException(status_code=500, detail="serial search failed")
+
+
+def _unit_price(request):
+    try:
+        return float(str(request.price or 0).replace(",", "").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def _record_purchase_on_customer(request, user):
+    """
+    Called after a product lot is added to inventory. The supplier company is a
+    row in the customers collection (same schema orders use): matched by company
+    name (case-insensitive), or created from the details typed in the form.
+    Every purchase is appended to customer["purchases"] so it shows in that
+    party's history; purchases made on CREDIT also count towards "Returned" on
+    the users page (we owe them / it reduces what they owe us).
+    Returns None when nothing applies, else a small status dict.
+    """
+    try:
+        name = (request.supplier or "").strip()
+        mode = (request.payment_mode or "").strip().lower()
+        if not name or mode not in ("paid", "partial", "credit"):
+            return None
+        unit_price = _unit_price(request)
+        amount = round(unit_price * int(request.quantity or 0) * (1 + float(request.tax_rate or 0) / 100), 2)
+        if amount <= 0:
+            return None
+
+        db = customer_manager()
+        match = next((c for c in db.get_data(collection_name=CUSTOMER_COLLECTION, query={})
+                      if (c.get("company_name") or "").strip().lower() == name.lower()), None)
+        created = False
+        if match is None:
+            new_customer = customer_manager(
+                company_name=name,
+                company_address=(request.supplier_address or "").strip(),
+                gst_number=(request.supplier_gst or "").strip(),
+                contractor_person=(request.supplier_contact_person or "").strip(),
+                contractor_number=(request.supplier_contact_number or "").strip(),
+                contractor_email=(request.supplier_contact_email or "").strip(),
+            )
+            new_customer.add(collection_name=CUSTOMER_COLLECTION)
+            db.update_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": new_customer.customer_id},
+                           update_values={"credit_limit": 0, "credit_used": 0, "created_by": user["username"]})
+            customer_id, purchases = new_customer.customer_id, []
+            created = True
+        else:
+            customer_id, purchases = match["customer_id"], list(match.get("purchases") or [])
+
+        purchases.append({
+            "purchase_id": str(uuid.uuid4()),
+            "date": request.purchase_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "product_name": request.product_name,
+            "product_id": request.product_id,
+            "model_no": request.model_no,
+            "quantity": request.quantity,
+            "unit_price": unit_price,
+            "tax_rate": request.tax_rate,
+            "amount": amount,
+            **_purchase_record_payment(mode, amount, request.paid_amount, request.credit_days,
+                                       request.purchase_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")),
+            "lot_no": request.lot_no,
+            "added_by": user["username"],
+            "added_at": datetime.now(timezone.utc).isoformat(),
+        })
+        db.update_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": customer_id},
+                       update_values={"purchases": purchases})
+        return {"customer_id": customer_id, "amount": amount, "payment_mode": mode, "customer_created": created}
+    except Exception:
+        logging.error("recording purchase on customer ledger failed!")
+        return {"error": "inventory saved, but the customer ledger entry could not be recorded"}
+
+
+@app.get("/customer/company_list")
+def company_list(user: dict = Depends(require_role("service_manager", "admin", "accounts", "inventory_manager"))):
+    """Light list (no credit/financial data) used by the inventory form's company picker."""
+    try:
+        db = customer_manager()
+        rows = db.get_data(collection_name=CUSTOMER_COLLECTION, query={})
+        keep = ("customer_id", "company_name", "company_address", "gst_number",
+                "contractor_person", "contractor_number", "contractor_email")
+        dataset = sorted(({k: r.get(k, "") for k in keep} for r in rows if r.get("company_name")),
+                         key=lambda r: r["company_name"].lower())
+        return {"message": "company list", "dataset": dataset}
+    except Exception:
+        logging.error("company list cannot be fetched")
+        raise HTTPException(status_code=500, detail="company list cannot be fetched")
+
+
+def _norm_serial(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _assert_unique_product_serials(serials, exclude_lot_id=None, ignore_on_lot=None, ignore_serials=None):
+    """
+    Backend duplicate-serial guard for product_type "product" (the only category
+    where a serial number identifies one physical unit). Runs on every path that
+    puts serial numbers into inventory — manual typing, Excel upload, auto
+    generation, assembly approval — so the frontend check is no longer the only
+    line of defence.
+
+    Rejects (HTTP 400):
+      * blank serials,
+      * the same serial twice inside the request (case-insensitive, whitespace ignored),
+      * any serial already on a "product" lot in inventory (case-insensitive).
+
+    exclude_lot_id  - a lot whose serial list is being REPLACED by this request,
+                      so its own current serials don't count as clashes.
+    ignore_on_lot / ignore_serials
+                    - serials being pulled off lot `ignore_on_lot` in this same
+                      request (removed / marked faulty), so a serial can be
+                      taken off and put back in one save.
+    """
+    cleaned = [str(s).strip() for s in (serials or []) if s is not None]
+    if not cleaned:
+        return
+    if any(not c for c in cleaned):
+        raise HTTPException(status_code=400, detail="serial numbers cannot be blank")
+
+    seen, repeated = set(), []
+    for c in cleaned:
+        k = c.lower()
+        if k in seen and c not in repeated:
+            repeated.append(c)
+        seen.add(k)
+    if repeated:
+        raise HTTPException(status_code=400,
+                            detail=f"duplicate serial number(s) in this request: {', '.join(repeated[:10])}")
+
+    ignore = set(ignore_serials or [])
+    lots = inventory_manager().get_data(
+        collection_name=INVENTORY_COLLECTION,
+        query={"product_type": {"$in": ["product", None]}, "serial_numbers.0": {"$exists": True}},
+    )
+    clashes = []
+    for lot in lots:
+        lot_id = str(lot.get("_id"))
+        if exclude_lot_id is not None and lot_id == str(exclude_lot_id):
+            continue
+        for sn in lot.get("serial_numbers") or []:
+            k = _norm_serial(sn)
+            if k not in seen:
+                continue
+            if ignore_on_lot is not None and lot_id == str(ignore_on_lot) and k in ignore:
+                continue
+            clashes.append(str(sn).strip())
+    if clashes:
+        shown = list(dict.fromkeys(clashes))
+        more = f" (+{len(shown) - 10} more)" if len(shown) > 10 else ""
+        raise HTTPException(status_code=400,
+                            detail=f"serial number(s) already exist in inventory: {', '.join(shown[:10])}{more}")
+
+
+_ONCE_LOCK = threading.Lock()
+_ONCE_DONE = {}
+_ONCE_INFLIGHT = {}
+
+
+def _run_once(scope, user, payload, fn, ttl=60):
+    try:
+        body = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    except Exception:
+        body = str(payload)
+    raw = json.dumps([scope, (user or {}).get("username"), body], sort_keys=True, default=str)
+    key = hashlib.sha1(raw.encode()).hexdigest()
+    now = time.time()
+    with _ONCE_LOCK:
+        for k in [k for k, v in _ONCE_DONE.items() if now - v[0] > ttl]:
+            del _ONCE_DONE[k]
+        hit = _ONCE_DONE.get(key)
+        if hit:
+            return hit[1]
+        ev = _ONCE_INFLIGHT.get(key)
+        owner = ev is None
+        if owner:
+            ev = threading.Event()
+            _ONCE_INFLIGHT[key] = ev
+    if not owner:
+        ev.wait(60)
+        with _ONCE_LOCK:
+            hit = _ONCE_DONE.get(key)
+        if hit:
+            return hit[1]
+        raise HTTPException(status_code=409, detail="same request was already in progress, check inventory before retrying")
+    try:
+        result = fn()
+        with _ONCE_LOCK:
+            _ONCE_DONE.clear()
+            _ONCE_DONE[key] = (time.time(), result)
+        return result
+    finally:
+        with _ONCE_LOCK:
+            _ONCE_INFLIGHT.pop(key, None)
+        ev.set()
+
+
+def _id_query(item_id):
+    try:
+        return {"_id": {"$in": [ObjectId(item_id), item_id]}}
+    except Exception:
+        return {"_id": item_id}
+
+
+def _find_lot(item_id, extra=None):
+    q = _id_query(item_id)
+    if extra:
+        q = {**q, **extra}
+    return mongodbclient().database[INVENTORY_COLLECTION].find_one(q)
+
+
+def _type_group(product_type):
+    return {"$in": ["product", None]} if (product_type or "product") == "product" else product_type
+
+
+def _assert_model_free(model_no, product_name, product_type, exclude_id=None):
+    # blocks ONLY when product name AND model no are BOTH the same as an existing lot
+    # (case-insensitive, ignoring leading/trailing spaces). Same model with a different
+    # product name, or same product name with a different model, is allowed.
+    model = str(model_no or "").strip()
+    name = str(product_name or "").strip()
+    if not model or not name:
+        return
+    q = {
+        "model_no": {"$regex": f"^{re.escape(model)}$", "$options": "i"},
+        "product_name": {"$regex": f"^\\s*{re.escape(name)}\\s*$", "$options": "i"},
+        "product_type": _type_group(product_type),
+    }
+    if exclude_id is not None:
+        q["_id"] = {"$ne": exclude_id}
+    hit = mongodbclient().database[INVENTORY_COLLECTION].find_one(q, {"product_name": 1})
+    if hit:
+        raise HTTPException(status_code=409,
+                            detail=f"product '{name}' with model no '{model}' already exists in inventory")
+
+
+def _assert_serials_free(serials, product_type, exclude_id=None):
+    cleaned = [str(s).strip() for s in (serials or []) if s is not None and str(s).strip()]
+    if not cleaned:
+        return
+    keys = [_norm_serial(c) for c in cleaned]
+    if len(set(keys)) != len(keys):
+        raise HTTPException(status_code=400, detail="duplicate serial numbers in this request")
+    variants = list({v for c in cleaned for v in (c, c.lower(), c.upper())})
+    q = {"serial_numbers": {"$in": variants}}
+    if exclude_id is not None:
+        q["_id"] = {"$ne": exclude_id}
+    new_type = (product_type or "product")
+    clashes = []
+    for lot in mongodbclient().database[INVENTORY_COLLECTION].find(q, {"serial_numbers": 1, "product_type": 1}):
+        holder = lot.get("product_type") or "product"
+        if holder != new_type and (holder == "damaged" or new_type == "damaged"):
+            continue
+        for sn in lot.get("serial_numbers") or []:
+            if _norm_serial(sn) in keys:
+                clashes.append(str(sn).strip())
+    if clashes:
+        shown = list(dict.fromkeys(clashes))
+        raise HTTPException(status_code=409,
+                            detail=f"serial number(s) already exist in inventory: {', '.join(shown[:10])}")
+
+
 @app.post("/inventory/create")
 def create_inventory(request: InventoryRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts", "inventory_manager"))):
+    return _run_once("create", user, request, lambda: _create_inventory_impl(request, user))
+
+
+def _create_inventory_impl(request: InventoryRequest, user: dict):
     try:
+        _validate_payment(request.payment_mode,
+                          round(_unit_price(request) * int(request.quantity or 0) * (1 + float(request.tax_rate or 0) / 100), 2),
+                          request.paid_amount, request.credit_days)
         # serial numbers are optional for accessories / spare_parts / service_parts —
         # only enforce the quantity match when at least one serial number was actually given
+        if request.product_type in ("spare_parts", "service_parts", "accessories"):
+            if not (request.supplier or "").strip():
+                raise HTTPException(status_code=400, detail="company name is required")
+            if not (request.invoice_no or "").strip():
+                raise HTTPException(status_code=400, detail="invoice number is required")
         serial_optional_types = ("accessories", "spare_parts", "service_parts")
         serials_required = request.product_type not in serial_optional_types or len(request.serial_numbers) > 0
         if serials_required and len(request.serial_numbers) != request.quantity:
@@ -3112,6 +4825,12 @@ def create_inventory(request: InventoryRequest, user: dict = Depends(require_rol
         # serial it already had as a normal product).
         if request.product_type == "product" and len(set(request.serial_numbers)) != len(request.serial_numbers):
             raise HTTPException(status_code=400, detail="serial numbers must be unique")
+        if request.product_type == "product":
+            _assert_unique_product_serials(request.serial_numbers)
+        if request.product_type in ("product", "accessories"):
+            _assert_model_free(request.model_no, request.product_name, request.product_type)
+        if request.product_type not in ("spare_parts", "service_parts"):
+            _assert_serials_free(request.serial_numbers, request.product_type)
 
         if request.product_type in ("spare_parts", "service_parts"):
             if not request.parent_product_name.strip():
@@ -3132,6 +4851,7 @@ def create_inventory(request: InventoryRequest, user: dict = Depends(require_rol
                 lot_no=request.lot_no,
                 supplier=request.supplier,
                 supplier_address=request.supplier_address,
+                invoice_no=request.invoice_no,
                 price=request.price or 0,
                 tax_rate=request.tax_rate,
                 product_type=request.product_type,
@@ -3142,7 +4862,11 @@ def create_inventory(request: InventoryRequest, user: dict = Depends(require_rol
                 created_by=user["username"],
             )
             part.add_part(collection_name=INVENTORY_COLLECTION)
-            return {"message": "part was listed successfully"}
+            resp = {"message": "part was listed successfully"}
+            ledger = _record_purchase_on_customer(request, user)
+            if ledger:
+                resp["ledger"] = ledger
+            return resp
 
         inventory_item = inventory_manager(
             product_name=request.product_name,
@@ -3155,6 +4879,7 @@ def create_inventory(request: InventoryRequest, user: dict = Depends(require_rol
             tax_rate=request.tax_rate,
             model_no=request.model_no,
             supplier_address=request.supplier_address,
+            invoice_no=request.invoice_no,
             serial_numbers=request.serial_numbers,
             product_type=request.product_type,
             warranty_until=(request.warranty_until or None) if request.product_type == "damaged" else None,
@@ -3163,7 +4888,14 @@ def create_inventory(request: InventoryRequest, user: dict = Depends(require_rol
         )
         inventory_item.add_or_merge(collection_name=INVENTORY_COLLECTION)
         logging.info("product listed successfully on inventory")
-        return {"message": "product was listed successfully"}
+
+        # purchase -> customer ledger (users page > Customers). Inventory is already
+        # saved at this point, so a ledger problem is reported back, not raised.
+        ledger = _record_purchase_on_customer(request, user)
+        resp = {"message": "product was listed successfully"}
+        if ledger:
+            resp["ledger"] = ledger
+        return resp
 
     except HTTPException:
         raise
@@ -3172,22 +4904,20 @@ def create_inventory(request: InventoryRequest, user: dict = Depends(require_rol
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/inventory/update/{product_id}")
-def update_inventory(product_id: str, request: InventoryUpdateRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts", "inventory_manager"))):
-    if product_id == "__blank_id__":
-        product_id = ""
+@app.post("/inventory/update/{item_id}")
+def update_inventory(item_id: str, request: InventoryUpdateRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts", "inventory_manager"))):
+    return _run_once("update:" + item_id, user, request, lambda: _update_inventory_impl(item_id, request, user))
+
+
+def _update_inventory_impl(item_id: str, request: InventoryUpdateRequest, user: dict):
     try:
         db = inventory_manager()
-        match_query = {"product_id": product_id}
-        if request.model_no is not None:
-            match_query["model_no"] = request.model_no if request.model_no else {"$in": [None, ""]}
-        if request.source_product_type == "product":
-            match_query["product_type"] = {"$in": ["product", None]}
-        elif request.source_product_type:
-            match_query["product_type"] = request.source_product_type
-        existing = db.get_data(collection_name=INVENTORY_COLLECTION, query=match_query)
-        if not existing:
+        lot = _find_lot(item_id)
+        if not lot:
             raise HTTPException(status_code=404, detail="product not found")
+        existing = [lot]
+        match_query = {"_id": lot["_id"]}
+        product_id = lot.get("product_id", "")
         current_serials = existing[0].get("serial_numbers") or []
         current_type = existing[0].get("product_type", "product")
 
@@ -3212,6 +4942,36 @@ def update_inventory(product_id: str, request: InventoryUpdateRequest, user: dic
         # for that part. Kept as two separate request fields so the faulty
         # ones can still be told apart afterwards for the damaged-category push.
         pulled_off_serials = set(request.remove_serial_numbers or []) | set(request.faulty_serial_numbers or [])
+
+        _final_name = updated_values.get("product_name", existing[0].get("product_name", ""))
+        _final_model = updated_values.get("model_no", existing[0].get("model_no", "")) or ""
+        _cur_type = str(current_type or "product").strip().lower()
+        if effective_type in ("product", "accessories") and str(_final_model).strip() and (
+            _norm_serial(_final_model) != _norm_serial(existing[0].get("model_no"))
+            or _norm_serial(_final_name) != _norm_serial(existing[0].get("product_name"))
+            or effective_type != _cur_type
+        ):
+            _assert_model_free(_final_model, _final_name, effective_type, exclude_id=existing[0]["_id"])
+        _explicit_serials = updated_values.get("serial_numbers")
+        _incoming = list(request.new_serial_numbers or []) + (list(_explicit_serials) if isinstance(_explicit_serials, list) else [])
+        if _incoming and effective_type not in ("spare_parts", "service_parts"):
+            _assert_serials_free(_incoming, effective_type, exclude_id=existing[0]["_id"])
+
+        # ---- backend duplicate-serial guard (product category only) ----
+        # Any serial that would end up on a "product" lot — newly added ones,
+        # an explicit serial_numbers list in updated_values, or the existing
+        # serials of a lot being converted into a "product" — must not already
+        # exist on another product lot (or repeat inside this request).
+        if effective_type == "product":
+            _lot_id = existing[0].get("_id")
+            _removed = {_norm_serial(x) for x in pulled_off_serials}
+            if request.new_serial_numbers:
+                _assert_unique_product_serials(request.new_serial_numbers, ignore_on_lot=_lot_id, ignore_serials=_removed)
+            _explicit = updated_values.get("serial_numbers")
+            if isinstance(_explicit, list) and _explicit:
+                _assert_unique_product_serials(_explicit, exclude_lot_id=_lot_id)
+            if str(current_type or "product").strip().lower() != "product" and current_serials:
+                _assert_unique_product_serials(current_serials, exclude_lot_id=_lot_id)
 
         # serial numbers are optional for accessories / spare_parts / service_parts,
         # so quantity is free to move independently of the serial list for those
@@ -3352,11 +5112,17 @@ def update_inventory(product_id: str, request: InventoryUpdateRequest, user: dic
                     reason=damage_reason,
                 ).add(collection_name=INVENTORY_COLLECTION)
 
-        db.update(collection_name=INVENTORY_COLLECTION, query=match_query,
-                   update_values=updated_values)
+        write_result = db.update(collection_name=INVENTORY_COLLECTION, query=match_query,
+                                  update_values=updated_values)
+        touched = getattr(write_result, "matched_count", None)
+        if touched is None:
+            touched = getattr(write_result, "deleted_count", 1)
+        if touched == 0:
+            raise HTTPException(status_code=409, detail="this product was changed or removed by someone else, refresh and try again")
         logging.info("inventory was updated")
         return {
             "message": "inventory was updated successfully",
+            "id": item_id,
             "product_id": product_id,
             "hologram_added": hologram_added,
             "hologram_leftover": hologram_leftover
@@ -3368,21 +5134,22 @@ def update_inventory(product_id: str, request: InventoryUpdateRequest, user: dic
         raise HTTPException(status_code=500, detail="inventory cannot be updated")
 
 
-@app.post("/inventory/delete/{product_id}")
-def delete_product(product_id: str, model_no: Optional[str] = None, user: dict = Depends(require_role("admin"))):
-    if product_id == "__blank_id__":
-        product_id = ""
+@app.post("/inventory/delete/{item_id}")
+def delete_product(item_id: str, user: dict = Depends(require_role("admin"))):
+    return _run_once("delete:" + item_id, user, {"id": item_id}, lambda: _delete_product_impl(item_id))
+
+
+def _delete_product_impl(item_id: str):
     try:
-        db = inventory_manager(product_id=product_id)
-        if model_no is not None:
-            existing = db.get_data(collection_name=INVENTORY_COLLECTION, query={"product_id": product_id, "model_no": model_no})
-            if not existing:
-                raise HTTPException(status_code=404, detail="product not found")
-            db.delete_data(collection_name=INVENTORY_COLLECTION, query={"_id": ObjectId(existing[0]["_id"])})
-        else:
-            db.delete(collection_name=INVENTORY_COLLECTION)
-        logging.info(f"product was deleted successfully from the inventory {product_id}")
-        return {"message": "product deletion was successful", "product_id": product_id}
+        db = inventory_manager()
+        lot = _find_lot(item_id)
+        if not lot:
+            raise HTTPException(status_code=404, detail="product not found")
+        del_result = db.delete_data(collection_name=INVENTORY_COLLECTION, query={"_id": lot["_id"]})
+        if getattr(del_result, "deleted_count", 1) == 0:
+            raise HTTPException(status_code=409, detail="this product was already removed, refresh and try again")
+        logging.info(f"product was deleted successfully from the inventory {item_id}")
+        return {"message": "product deletion was successful", "id": item_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -3390,10 +5157,12 @@ def delete_product(product_id: str, model_no: Optional[str] = None, user: dict =
         raise HTTPException(status_code=500, detail="product cannot be deleted")
 
 
-@app.post("/inventory/repair/{product_id}")
-def repair_damaged_product(product_id: str, model_no: Optional[str] = None, user: dict = Depends(require_role("service_manager", "admin", "accounts", "inventory_manager"))):
-    if product_id == "__blank_id__":
-        product_id = ""
+@app.post("/inventory/repair/{item_id}")
+def repair_damaged_product(item_id: str, user: dict = Depends(require_role("service_manager", "admin", "accounts", "inventory_manager"))):
+    return _run_once("repair:" + item_id, user, {"id": item_id}, lambda: _repair_damaged_product_impl(item_id, user))
+
+
+def _repair_damaged_product_impl(item_id: str, user: dict):
     """Action button on the Damaged Product row (replaces Delete there).
 
     - If the damaged entry is a full PRODUCT (it carries serial numbers,
@@ -3407,13 +5176,9 @@ def repair_damaged_product(product_id: str, model_no: Optional[str] = None, user
     """
     try:
         db = inventory_manager()
-        match_query = {"product_id": product_id, "product_type": "damaged"}
-        if model_no is not None:
-            match_query["model_no"] = model_no
-        existing = db.get_data(collection_name=INVENTORY_COLLECTION, query=match_query)
-        if not existing:
+        item = _find_lot(item_id, {"product_type": "damaged"})
+        if not item:
             raise HTTPException(status_code=404, detail="damaged product not found")
-        item = existing[0]
 
         is_product = bool(item.get("serial_numbers"))
 
@@ -3429,16 +5194,18 @@ def repair_damaged_product(product_id: str, model_no: Optional[str] = None, user
                 video="",
                 location="indoor",
                 spare_parts="",
-                created_by=user["username"]
+                created_by=user["username"],
+                product_name=item.get("product_name", ""),
+                model_no=item.get("model_no", "")
             )
-            db.update(collection_name=INVENTORY_COLLECTION, query={"_id": ObjectId(item["_id"])},
+            db.update(collection_name=INVENTORY_COLLECTION, query={"_id": item["_id"]},
                       update_values={"damage_status": "Sent for Repair (Inhouse Warranty)"})
-            logging.info(f"damaged product {product_id} sent for in-house repair, service {svc.service_id} created")
+            logging.info(f"damaged product {item_id} sent for in-house repair, service {svc.service_id} created")
             return {"message": "sent for in-house warranty repair", "mode": "product", "service_id": svc.service_id}
         else:
-            db.update(collection_name=INVENTORY_COLLECTION, query={"_id": ObjectId(item["_id"])},
+            db.update(collection_name=INVENTORY_COLLECTION, query={"_id": item["_id"]},
                       update_values={"damage_status": "Send to Parent Company"})
-            logging.info(f"damaged part {product_id} marked to send to parent company")
+            logging.info(f"damaged part {item_id} marked to send to parent company")
             return {"message": "marked to send to parent company", "mode": "part"}
     except HTTPException:
         raise
@@ -3483,7 +5250,7 @@ def search_customer(term: str = "", user: dict = Depends(get_current_user)):
 
 
 @app.post("/customer/create")
-def create_customer(request: CustomerRequest, user: dict = Depends(require_role("admin", "accounts", "distributor"))):
+def create_customer(request: CustomerRequest, user: dict = Depends(require_role("admin", "accounts", "distributor", "inventory_manager"))):
     try:
         new_customer = customer_manager(
             company_name=request.company_name,
@@ -3537,6 +5304,109 @@ def update_customer(customer_id: str, request: CustomerUpdateRequest, user: dict
     except Exception as e:
         logging.error("customer updation was unsuccessful!")
         raise HTTPException(status_code=500, detail="customer cannot be updated")
+
+
+@app.post("/customer/add_return/{customer_id}")
+def add_customer_return(customer_id: str, request: CustomerReturnRequest, user: dict = Depends(require_role("admin", "accounts"))):
+    try:
+        if request.amount <= 0:
+            raise HTTPException(status_code=400, detail="return amount must be greater than zero")
+        db = customer_manager()
+        found = db.get_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": customer_id})
+        if not found:
+            raise HTTPException(status_code=404, detail="no customer found with this id")
+        returns = list(found[0].get("returns") or [])
+        returns.append({
+            "amount": request.amount,
+            "note": (request.note or "").strip(),
+            "return_date": request.return_date or datetime.now(timezone.utc).isoformat(),
+            "added_by": user["username"],
+            "added_at": datetime.now(timezone.utc).isoformat()
+        })
+        db.update(collection_name=CUSTOMER_COLLECTION, query={"customer_id": customer_id},
+                  update_values={"returns": returns})
+        return {"message": "return added", "customer_id": customer_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("adding customer return failed!")
+        raise HTTPException(status_code=500, detail="return could not be added")
+
+
+class PurchasePaymentRequest(BaseModel):
+    amount: float
+    note: str = ""
+    payment_date: str = ""
+
+
+@app.post("/customer/purchase_payment/{customer_id}/{purchase_id}")
+def add_purchase_payment(customer_id: str, purchase_id: str, request: PurchasePaymentRequest,
+                         user: dict = Depends(require_role("admin", "accounts"))):
+    """Records a later payment against the unpaid balance of a credit / partial purchase."""
+    try:
+        if request.amount <= 0:
+            raise HTTPException(status_code=400, detail="payment amount must be greater than zero")
+        db = customer_manager()
+        found = db.get_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": customer_id})
+        if not found:
+            raise HTTPException(status_code=404, detail="no customer found with this id")
+        purchases = list(found[0].get("purchases") or [])
+        target = next((p for p in purchases if p.get("purchase_id") == purchase_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="no purchase found with this id")
+        amount = float(target.get("amount") or 0)
+        if (target.get("payment_mode") or "paid") == "paid":
+            raise HTTPException(status_code=400, detail="this purchase is already fully paid")
+        # legacy credit rows have no paid_amount -> nothing was paid up front
+        paid_before = float(target.get("paid_amount") or 0) + sum(float(x.get("amount") or 0) for x in (target.get("payments") or []))
+        balance = round(amount - paid_before, 2)
+        if request.amount > balance + 0.005:
+            raise HTTPException(status_code=400, detail=f"payment is more than the pending balance (Rs {balance})")
+        payments = list(target.get("payments") or [])
+        payments.append({
+            "amount": round(request.amount, 2),
+            "note": (request.note or "").strip(),
+            "payment_date": request.payment_date or datetime.now(timezone.utc).isoformat(),
+            "added_by": user["username"],
+            "added_at": datetime.now(timezone.utc).isoformat(),
+        })
+        target["payments"] = payments
+        db.update_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": customer_id}, update_values={"purchases": purchases})
+        return {"message": "payment recorded", "balance": round(balance - request.amount, 2)}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("recording purchase payment failed!")
+        raise HTTPException(status_code=500, detail="payment could not be recorded")
+
+
+@app.post("/customer/add_debit/{customer_id}")
+def add_customer_debit(customer_id: str, request: CustomerReturnRequest, user: dict = Depends(require_role("admin", "accounts"))):
+    """Adds a manual Debit entry for a company (counts towards its Debit total).
+    Credit entries (formerly 'returns') are still added via /customer/add_return/{customer_id}."""
+    try:
+        if request.amount <= 0:
+            raise HTTPException(status_code=400, detail="debit amount must be greater than zero")
+        db = customer_manager()
+        found = db.get_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": customer_id})
+        if not found:
+            raise HTTPException(status_code=404, detail="no customer found with this id")
+        debits = list(found[0].get("debits") or [])
+        debits.append({
+            "amount": request.amount,
+            "note": (request.note or "").strip(),
+            "debit_date": request.return_date or datetime.now(timezone.utc).isoformat(),
+            "added_by": user["username"],
+            "added_at": datetime.now(timezone.utc).isoformat()
+        })
+        db.update(collection_name=CUSTOMER_COLLECTION, query={"customer_id": customer_id},
+                  update_values={"debits": debits})
+        return {"message": "debit added", "customer_id": customer_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("adding customer debit failed!")
+        raise HTTPException(status_code=500, detail="debit could not be added")
 
 
 @app.post("/customer/delete/{customer_id}")
@@ -3801,9 +5671,7 @@ def _fulfill_demo_unit(customer_id: str, customer: dict, items: list, allocated_
 
     demo_items = []
     for item in items:
-        allocated_serials = inventory_db.allocate_units(
-            collection_name=INVENTORY_COLLECTION, product_id=item["product_id"], quantity=item["quantity"]
-        )
+        allocated_serials = _auto_pick_units(inventory_db, item["product_id"], item["quantity"])
         demo_items.append({
             "product_id": item["product_id"],
             "product_name": item["product_name"],
@@ -3855,9 +5723,7 @@ def _fulfill_demo_request(items: list, requester: str, remarks: str, request_id:
 
     ids = []
     for item in items:
-        serials = inventory_db.allocate_units(
-            collection_name=INVENTORY_COLLECTION, product_id=item["product_id"],
-            quantity=item["quantity"], model_no=item.get("model_no") or None)
+        serials = _auto_pick_units(inventory_db, item["product_id"], item["quantity"], item.get("model_no") or None)
         for i in range(item["quantity"]):
             serial = serials[i] if i < len(serials) else None
             alloc = allocation_manager(
@@ -3871,6 +5737,48 @@ def _fulfill_demo_request(items: list, requester: str, remarks: str, request_id:
             ids.append(alloc.allocation_id)
     logging.info(f"demo request {request_id} allocated to {requester}: {ids}")
     return ids
+
+
+@app.post("/allocation/assign_demo")
+def assign_demo_unit(request: AssignDemoRequest, user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
+    try:
+        tech = request.technician_id.strip()
+        if not tech:
+            raise HTTPException(status_code=400, detail="select a technician")
+        ids = _fulfill_demo_request([i.dict() for i in request.items], tech, request.remarks.strip(), "")
+        _notify([tech], kind="demo_assigned", title="Demo unit assigned to you",
+                body=", ".join(f"{i.product_name} x{i.quantity}" for i in request.items),
+                link="/pages/technician.html?tab=demo")
+        return {"message": "demo unit assigned", "allocation_ids": ids}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("demo unit assignment failed")
+        raise HTTPException(status_code=500, detail="demo unit could not be assigned")
+
+
+@app.post("/allocation/reassign_demo/{allocation_id}")
+def reassign_demo_unit(allocation_id: str, request: ReassignDemoRequest,
+                       user: dict = Depends(require_role("service_manager", "admin", "accounts"))):
+    try:
+        tech = request.technician_id.strip()
+        if not tech:
+            raise HTTPException(status_code=400, detail="select a technician")
+        rows = mongodbclient().get_data(collection_name=ALLOCATION_COLLECTION, query={"allocation_id": allocation_id})
+        if not rows or rows[0].get("allocation_type") not in ("demo_unit", "product"):
+            raise HTTPException(status_code=404, detail="demo unit not found")
+        if rows[0].get("return_status"):
+            raise HTTPException(status_code=409, detail="this demo unit is already returned")
+        mongodbclient().update_data(collection_name=ALLOCATION_COLLECTION, query={"allocation_id": allocation_id},
+                                    update_values={"allocated_by": tech, "sales_person": _user_snapshot(tech)})
+        _notify([tech], kind="demo_assigned", title="Demo unit assigned to you", body="A demo unit was handed over to you",
+                link="/pages/technician.html?tab=demo")
+        return {"message": "demo unit reassigned", "allocation_id": allocation_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("demo unit reassignment failed")
+        raise HTTPException(status_code=500, detail="demo unit could not be reassigned")
 
 
 @app.post("/allocation/create_demo_unit")
@@ -3898,6 +5806,9 @@ class DemoUnitRequestModel(BaseModel):
 
 class ServiceRequestModel(BaseModel):
     product_id: str
+    company_name: str = ""
+    product_name: str = ""
+    model_no: str = ""
     serial_no: str
     purchase_date: str
     issue: str
@@ -3905,6 +5816,7 @@ class ServiceRequestModel(BaseModel):
     video: str = ""
     location: str = "indoor"
     spare_parts: str = ""
+    address: str = ""
 
 
 class SparePartRequestFlagModel(BaseModel):
@@ -3929,6 +5841,8 @@ class RequestApproveModel(BaseModel):
     # only used when approving a convert_to_order request
     invoice_no: str = ""
     invoice_date: str = ""
+    payment_mode: str = ""          # same modes as a normal order (Credit / Partial / UPI ...)
+    payment_details: dict = {}
 
 
 class ReturnRequestModel(BaseModel):
@@ -3937,8 +5851,9 @@ class ReturnRequestModel(BaseModel):
 
 
 class ConvertToOrderRequest(BaseModel):
-    company_name: str
-    company_address: str
+    customer_id: str = ""          # set when an already-registered company is picked
+    company_name: str = ""         # used only when no customer_id is given
+    company_address: str = ""
     gst_number: str = ""
     price: float
     tax_rate: float = 0
@@ -3967,12 +5882,23 @@ def raise_demo_unit_request(request: DemoUnitRequestModel, user: dict = Depends(
         raise HTTPException(status_code=500, detail="request could not be raised")
 
 
+def _can_act_on_demo(alloc: dict, user: dict) -> bool:
+    owner = alloc.get("allocated_by")
+    if owner == user["username"]:
+        return True
+    try:
+        team = mongodbclient().get_data(collection_name=ACCOUNTS_COLLECTION,
+                                        query={"role": "distributor", "manager": user["username"]})
+        return owner in {t.get("username") for t in team}
+    except Exception:
+        logging.error("team lookup failed while checking demo unit ownership")
+        return False
+
+
 @app.post("/allocation/convert_to_order/{allocation_id}")
-def convert_demo_to_order(allocation_id: str, request: ConvertToOrderRequest, user: dict = Depends(require_role("distributor"))):
+def convert_demo_to_order(allocation_id: str, request: ConvertToOrderRequest, user: dict = Depends(require_role("distributor", "inventory_manager"))):
     """Distributor asks to turn a dispatched demo unit into an order. Raises an approval request."""
     try:
-        if not request.company_name.strip() or not request.company_address.strip():
-            raise HTTPException(status_code=400, detail="company name and address are required")
         if request.price <= 0:
             raise HTTPException(status_code=400, detail="enter a valid price")
 
@@ -3981,7 +5907,8 @@ def convert_demo_to_order(allocation_id: str, request: ConvertToOrderRequest, us
         if not matches:
             raise HTTPException(status_code=404, detail="demo unit not found")
         alloc = matches[0]
-        if alloc.get("allocation_type") != "demo_unit" or alloc.get("allocated_by") != user["username"]:
+        # same allocation types the My Demo Units table lists (/allocation/mine)
+        if alloc.get("allocation_type") not in ("demo_unit", "product") or not _can_act_on_demo(alloc, user):
             raise HTTPException(status_code=403, detail="this is not your demo unit")
         if not alloc.get("dispatch"):
             raise HTTPException(status_code=400, detail="only dispatched demo units can be converted to an order")
@@ -3992,11 +5919,29 @@ def convert_demo_to_order(allocation_id: str, request: ConvertToOrderRequest, us
         if (alloc.get("return_request") or {}).get("status") == "pending":
             raise HTTPException(status_code=400, detail="a return request is pending for this demo unit")
 
-        customer = {
-            "company_name": request.company_name.strip(),
-            "company_address": request.company_address.strip(),
-            "gst_number": request.gst_number.strip(),
-        }
+        if request.customer_id.strip():
+            # an already-registered company was picked: reuse it (no duplicate gets created on approval)
+            rows = customer_manager().get_data(collection_name=CUSTOMER_COLLECTION,
+                                               query={"customer_id": request.customer_id.strip()})
+            if not rows:
+                raise HTTPException(status_code=404, detail="selected company not found")
+            picked = rows[0]
+            if picked.get("created_by") not in (user["username"], alloc.get("allocated_by")):
+                raise HTTPException(status_code=403, detail="this company does not belong to you")
+            customer = {
+                "customer_id": picked["customer_id"],
+                "company_name": picked.get("company_name", ""),
+                "company_address": picked.get("company_address", ""),
+                "gst_number": picked.get("gst_number", ""),
+            }
+        else:
+            if not request.company_name.strip() or not request.company_address.strip():
+                raise HTTPException(status_code=400, detail="company name and address are required")
+            customer = {
+                "company_name": request.company_name.strip(),
+                "company_address": request.company_address.strip(),
+                "gst_number": request.gst_number.strip(),
+            }
         items = [{
             "product_id": i.get("product_id"), "product_name": i.get("product_name"),
             "model_no": i.get("model_no", ""), "serial_numbers": i.get("serial_numbers", []),
@@ -4023,7 +5968,7 @@ def convert_demo_to_order(allocation_id: str, request: ConvertToOrderRequest, us
 
 
 @app.post("/allocation/return_request/{allocation_id}")
-def raise_demo_return_request(allocation_id: str, request: ReturnRequestModel, user: dict = Depends(require_role("distributor"))):
+def raise_demo_return_request(allocation_id: str, request: ReturnRequestModel, user: dict = Depends(require_role("distributor", "inventory_manager"))):
     """Distributor reports a dispatched demo unit as returned; it is marked returned once approved."""
     try:
         through = request.returned_through.strip()
@@ -4044,7 +5989,7 @@ def raise_demo_return_request(allocation_id: str, request: ReturnRequestModel, u
         if not matches:
             raise HTTPException(status_code=404, detail="demo unit not found")
         alloc = matches[0]
-        if alloc.get("allocation_type") != "demo_unit" or alloc.get("allocated_by") != user["username"]:
+        if alloc.get("allocation_type") != "demo_unit" or not _can_act_on_demo(alloc, user):
             raise HTTPException(status_code=403, detail="this is not your demo unit")
         if alloc.get("return_status") == "returned":
             raise HTTPException(status_code=400, detail="this demo unit was already returned")
@@ -4073,30 +6018,65 @@ def raise_demo_return_request(allocation_id: str, request: ReturnRequestModel, u
         raise HTTPException(status_code=500, detail="return request could not be raised")
 
 
-def _convert_demo_to_order(alloc: dict, details: dict, raised_by: str, approver: str, invoice_no: str, invoice_date: str):
+_REQ_LOCKS = {}
+_REQ_LOCKS_GUARD = threading.Lock()
+
+
+@contextlib.contextmanager
+def _request_lock(request_id: str):
+    with _REQ_LOCKS_GUARD:
+        lock = _REQ_LOCKS.setdefault(request_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="this request is already being processed, please wait")
+    try:
+        yield
+    finally:
+        lock.release()
+        with _REQ_LOCKS_GUARD:
+            _REQ_LOCKS.pop(request_id, None)
+
+
+def _convert_demo_to_order(alloc: dict, details: dict, raised_by: str, approver: str, invoice_no: str, invoice_date: str,
+                           payment_mode: str = "", payment_details: dict = None, request_id: str = ""):
     """Moves an approved demo unit into Orders: same products/serials/company/price, dispatch info
     carried over (with the entered invoice details), and the allocation entry is removed.
-    Stock is NOT touched — the units were already deducted when the demo was allotted."""
+    Stock is NOT touched — the units were already deducted when the demo was allotted.
+    The order gets a real payment mode (Credit / Partial / UPI ...) chosen at conversion time."""
+    already = (alloc.get("converted_to_order") or {}).get("order_id")
+    if already:
+        return already
+    # validate the payment first so a bad choice never leaves a half-created company behind
+    conv_items = [{"price": details.get("price", 0), "tax_rate": details.get("tax_rate", 0), "quantity": i.get("quantity", 1)}
+                  for i in alloc.get("items", [])]
+    payment_details = _validate_order_payment(payment_mode, payment_details, _order_grand_total(conv_items))
+
     cust = dict(details.get("customer") or {})
-    new_customer = customer_manager(
-        company_name=cust.get("company_name"),
-        company_address=cust.get("company_address"),
-        gst_number=cust.get("gst_number"),
-        contractor_person="",
-        contractor_number="",
-        contractor_email="",
-    )
-    new_customer.add(collection_name=CUSTOMER_COLLECTION)
-    customer_manager().update_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": new_customer.customer_id},
-                                    update_values={"created_by": raised_by})
-    customer_snapshot = {
-        "customer_id": new_customer.customer_id,
-        "company_name": new_customer.company_name,
-        "company_address": new_customer.company_address,
-        "gst_number": new_customer.gst_number,
-        "contractor_person": "", "contractor_number": "", "contractor_email": "",
-        "created_by": raised_by,
-    }
+    existing = []
+    if cust.get("customer_id"):
+        # an already-registered company was picked: reuse it instead of creating a duplicate
+        existing = customer_manager().get_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": cust["customer_id"]})
+    if existing:
+        customer_snapshot = {k: v for k, v in existing[0].items() if k != "_id"}
+    else:
+        new_customer = customer_manager(
+            company_name=cust.get("company_name"),
+            company_address=cust.get("company_address"),
+            gst_number=cust.get("gst_number"),
+            contractor_person="",
+            contractor_number="",
+            contractor_email="",
+        )
+        new_customer.add(collection_name=CUSTOMER_COLLECTION)
+        customer_manager().update_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": new_customer.customer_id},
+                                        update_values={"created_by": raised_by})
+        customer_snapshot = {
+            "customer_id": new_customer.customer_id,
+            "company_name": new_customer.company_name,
+            "company_address": new_customer.company_address,
+            "gst_number": new_customer.gst_number,
+            "contractor_person": "", "contractor_number": "", "contractor_email": "",
+            "created_by": raised_by,
+        }
 
     price = details.get("price", 0)
     tax_rate = details.get("tax_rate", 0)
@@ -4108,7 +6088,7 @@ def _convert_demo_to_order(alloc: dict, details: dict, raised_by: str, approver:
 
     order = order_manager(
         customer=customer_snapshot, items=order_items,
-        payment_mode="Demo Conversion", payment_details={}, discount=0,
+        payment_mode=payment_mode, payment_details=payment_details, discount=0,
         creator={"type": "request", "raised_by": raised_by, "approved_by": approver}
     )
     order.add(collection_name=ORDERS_COLLECTION)
@@ -4122,7 +6102,17 @@ def _convert_demo_to_order(alloc: dict, details: dict, raised_by: str, approver:
                  update_values={"status": "processing", "dispatch": dispatch,
                                 "converted_from_demo": {"allocation_id": alloc.get("allocation_id"),
                                                         "allotment_date": alloc.get("allotment_date")}})
-    allocation_manager().delete(collection_name=ALLOCATION_COLLECTION, query={"allocation_id": alloc.get("allocation_id")})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        allocation_manager().update_data(
+            collection_name=ALLOCATION_COLLECTION, query={"allocation_id": alloc.get("allocation_id")},
+            update_values={"return_status": "returned", "returned_on": now_iso, "returned_by": approver,
+                           "converted_to_order": {"order_id": order.order_id, "converted_on": now_iso,
+                                                  "converted_by": approver, "invoice_no": invoice_no},
+                           "convert_request": {"request_id": request_id or "", "status": "approved",
+                                               "order_id": order.order_id}})
+    except Exception as alloc_err:
+        logging.error(f"order {order.order_id} created but allocation {alloc.get('allocation_id')} could not be marked returned: {alloc_err}")
     logging.info(f"demo allocation {alloc.get('allocation_id')} converted to order {order.order_id}")
     return order.order_id
 
@@ -4223,18 +6213,23 @@ def raise_order_request(request: OrderRequestModel, user: dict = Depends(require
 @app.post("/request/service")
 def raise_service_request(request: ServiceRequestModel, user: dict = Depends(require_role("technician", "distributor"))):
     try:
+        address = _check_field_address(request.location, request.address)
         req = request_manager(
             request_type="service",
             raised_by=user["username"],
             details={
                 "product_id": request.product_id,
+                "company_name": request.company_name,
+                "product_name": request.product_name,
+                "model_no": request.model_no,
                 "serial_no": request.serial_no,
                 "purchase_date": request.purchase_date,
                 "issue": request.issue,
                 "image": request.image,
                 "video": request.video,
                 "location": request.location,
-                "spare_parts": request.spare_parts
+                "spare_parts": request.spare_parts,
+                "address": address
             }
         )
         req.add(collection_name=REQUESTS_COLLECTION)
@@ -4284,6 +6279,11 @@ def my_requests(user: dict = Depends(get_current_user)):
 
 @app.post("/request/approve/{request_id}")
 def approve_request(request_id: str, body: RequestApproveModel = None, user: dict = Depends(require_role("admin", "accounts", "service_manager"))):
+    with _request_lock(request_id):
+        return _approve_request_locked(request_id, body, user)
+
+
+def _approve_request_locked(request_id: str, body, user: dict):
     try:
         db = request_manager()
         existing = db.get_data(collection_name=REQUESTS_COLLECTION, query={"request_id": request_id})
@@ -4334,7 +6334,8 @@ def approve_request(request_id: str, body: RequestApproveModel = None, user: dic
             if not found:
                 raise HTTPException(status_code=404, detail="demo unit allocation no longer exists")
             order_id = _convert_demo_to_order(found[0], details, req["raised_by"], user["username"],
-                                              body.invoice_no.strip(), body.invoice_date.strip())
+                                              body.invoice_no.strip(), body.invoice_date.strip(),
+                                              body.payment_mode, body.payment_details, request_id=request_id)
             db.set_status(collection_name=REQUESTS_COLLECTION, request_id=request_id,
                            status="approved", resolved_by=user["username"])
             return {"message": "request approved and demo unit converted to order", "order_id": order_id}
@@ -4373,13 +6374,27 @@ def approve_request(request_id: str, body: RequestApproveModel = None, user: dic
                 technician_id=req["raised_by"],
                 location=details.get("location", "indoor"),
                 spare_parts=details.get("spare_parts", ""),
-                created_by=req["raised_by"]
+                created_by=req["raised_by"],
+                product_name=details.get("product_name", ""),
+                model_no=details.get("model_no", ""),
+                company_name=details.get("company_name", "")
             )
+            _save_service_address(service.service_id, details.get("address", ""))
             if details.get("video"):
                 _raise_media_review_request(service.service_id, user["username"])
             db.set_status(collection_name=REQUESTS_COLLECTION, request_id=request_id,
                            status="approved", resolved_by=user["username"])
             return {"message": "request approved and service created", "service_id": service.service_id}
+
+        if req["request_type"] == "reschedule":
+            details = req["details"]
+            _apply_reschedule_request(details, req["raised_by"])
+            db.set_status(collection_name=REQUESTS_COLLECTION, request_id=request_id,
+                           status="approved", resolved_by=user["username"])
+            _notify([req["raised_by"]], kind="reschedule_approved", title="Reschedule approved",
+                    body=f"{details.get('label')} is now on {details.get('requested_date')}",
+                    service_id=details.get("target_id", ""), link="/pages/technician.html?tab=requests")
+            return {"message": "reschedule approved"}
 
         # media_review: approving means admin/accounts confirmed they downloaded the
         # video — it's cleared from the database afterwards to free up storage.
@@ -4412,27 +6427,18 @@ def approve_request(request_id: str, body: RequestApproveModel = None, user: dic
                            status="approved", resolved_by=user["username"])
             return {"message": "request approved and service status updated", "service_id": details.get("service_id")}
 
-        # spare_part requests: approving now also issues the part — creates a
-        # spare-part allocation automatically so it shows up on the Dispatch page
+        # spare_part requests: the service manager picks the hologram number(s) on the Allocated
+        # page, which opens with this service and the requested part(s) already added. The request
+        # stays pending until that allocation is made (create_allocation closes it).
         if req["request_type"] == "spare_part":
-            details = req["details"]
-            alloc = allocation_manager(
-                created_by=user["username"],
-                sales_person={},
-                items=[],
-                spare_part={
-                    "service_id": details.get("service_id"),
-                    "part_name": details.get("note", "Spare part"),
-                    "quantity": 1
-                },
-                company_name="",
-                address=""
-            )
-            alloc.add(collection_name=ALLOCATION_COLLECTION)
-
-            db.set_status(collection_name=REQUESTS_COLLECTION, request_id=request_id,
-                           status="approved", resolved_by=user["username"])
-            return {"message": "request approved and spare part issued", "allocation_id": alloc.allocation_id}
+            details = req["details"] or {}
+            parts = details.get("parts") or []
+            names = [p.get("part_name", "") for p in parts if p.get("part_name")] or ([details.get("note")] if details.get("note") else [])
+            qs = urllib.parse.urlencode({"alloc_service": details.get("service_id", ""),
+                                         "alloc_parts": "|".join(names), "alloc_request": request_id})
+            return {"message": "choose the hologram number(s) to allocate", "pending_allocation": True,
+                    "service_id": details.get("service_id"), "parts": names,
+                    "redirect": f"allocated.html?{qs}"}
 
         db.set_status(collection_name=REQUESTS_COLLECTION, request_id=request_id,
                        status="approved", resolved_by=user["username"])
@@ -4447,6 +6453,11 @@ def approve_request(request_id: str, body: RequestApproveModel = None, user: dic
 
 @app.post("/request/reject/{request_id}")
 def reject_request(request_id: str, request: RequestRejectModel, user: dict = Depends(require_role("admin", "accounts", "service_manager"))):
+    with _request_lock(request_id):
+        return _reject_request_locked(request_id, request, user)
+
+
+def _reject_request_locked(request_id: str, request, user: dict):
     try:
         db = request_manager()
         existing = db.get_data(collection_name=REQUESTS_COLLECTION, query={"request_id": request_id})
@@ -4461,6 +6472,12 @@ def reject_request(request_id: str, request: RequestRejectModel, user: dict = De
                 svc_db = service_detail()
                 svc_db.update_data(collection_name=SERVICE_COLLECTION, query={"service_id": service_id},
                                     update_values={"video": ""})
+
+        if existing[0]["request_type"] == "reschedule":
+            d = existing[0]["details"]
+            _notify([existing[0]["raised_by"]], kind="reschedule_rejected", title="Reschedule request rejected",
+                    body=f"{d.get('label')}" + (f" - {request.reason.strip()}" if request.reason.strip() else ""),
+                    service_id=d.get("target_id", ""), link="/pages/technician.html?tab=requests")
 
         if existing[0]["request_type"] in ("convert_to_order", "return_demo"):
             aid = existing[0]["details"].get("allocation_id")
@@ -4478,6 +6495,95 @@ def reject_request(request_id: str, request: RequestRejectModel, user: dict = De
     except Exception as e:
         logging.error("rejecting request failed!")
         raise HTTPException(status_code=500, detail="request could not be rejected")
+
+
+class PartialApproveModel(BaseModel):
+    approved_indexes: list[int]
+    remarks: str
+
+
+class PartialRespondModel(BaseModel):
+    accept: bool
+    reason: str = ""
+
+
+@app.post("/request/partial_approve/{request_id}")
+def partial_approve_request(request_id: str, body: PartialApproveModel, user: dict = Depends(require_role("admin", "accounts", "service_manager"))):
+    try:
+        db = request_manager()
+        found = db.get_data(collection_name=REQUESTS_COLLECTION, query={"request_id": request_id})
+        if not found:
+            raise HTTPException(status_code=404, detail="request not found")
+        req = found[0]
+        if req["status"] != "pending":
+            raise HTTPException(status_code=400, detail=f"request already {req['status']}")
+        if req["request_type"] not in ("demo_unit", "order"):
+            raise HTTPException(status_code=400, detail="partial approval is only for demo unit and order requests")
+        details = dict(req.get("details") or {})
+        items = list(details.get("items") or [])
+        if len(items) < 2:
+            raise HTTPException(status_code=400, detail="partial approval needs at least 2 products")
+        idx = sorted(set(body.approved_indexes))
+        if not idx or any(i < 0 or i >= len(items) for i in idx):
+            raise HTTPException(status_code=400, detail="select at least one product to approve")
+        if len(idx) >= len(items):
+            raise HTTPException(status_code=400, detail="all products selected, use normal approve")
+        remarks = (body.remarks or "").strip()
+        if not remarks:
+            raise HTTPException(status_code=400, detail="remarks are required for partial approval")
+        now = datetime.now(timezone.utc).isoformat()
+        details["partial"] = {
+            "approved_items": [items[i] for i in idx],
+            "unapproved_items": [items[i] for i in range(len(items)) if i not in idx],
+            "remarks": remarks,
+            "by": user["username"],
+            "at": now
+        }
+        db.update_data(collection_name=REQUESTS_COLLECTION, query={"request_id": request_id},
+                       update_values={"status": "partially_approved", "details": details,
+                                      "resolved_by": user["username"], "resolved_at": now, "reason": remarks})
+        return {"message": "partially approved, sent back to the distributor for confirmation"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"partial approval failed! {e}")
+        raise HTTPException(status_code=500, detail="partial approval failed")
+
+
+@app.post("/request/partial_respond/{request_id}")
+def partial_respond_request(request_id: str, body: PartialRespondModel, user: dict = Depends(require_role("distributor"))):
+    try:
+        import shutil
+        db = request_manager()
+        found = db.get_data(collection_name=REQUESTS_COLLECTION, query={"request_id": request_id})
+        if not found or found[0].get("raised_by") != user["username"]:
+            raise HTTPException(status_code=404, detail="request not found")
+        req = found[0]
+        if req["status"] != "partially_approved":
+            raise HTTPException(status_code=400, detail=f"request already {req['status']}")
+        partial = (req.get("details") or {}).get("partial") or {}
+
+        if not body.accept:
+            db.set_status(collection_name=REQUESTS_COLLECTION, request_id=request_id,
+                          status="partial_rejected", resolved_by=user["username"], reason=(body.reason or "").strip())
+            return {"message": "partial approval rejected, request closed"}
+
+        new_details = {k: v for k, v in (req.get("details") or {}).items() if k != "partial"}
+        new_details["items"] = partial.get("approved_items", [])
+        new_details["parent_request_id"] = request_id
+        new_req = request_manager(request_type=req["request_type"], raised_by=req["raised_by"], details=new_details)
+        src = os.path.join(ORDER_ATTACH_DIR, request_id)
+        if new_details.get("attachments") and os.path.isdir(src):
+            shutil.copytree(src, os.path.join(ORDER_ATTACH_DIR, new_req.request_id), dirs_exist_ok=True)
+        new_req.add(collection_name=REQUESTS_COLLECTION)
+        db.set_status(collection_name=REQUESTS_COLLECTION, request_id=request_id,
+                      status="partial_accepted", resolved_by=user["username"], reason=(body.reason or "").strip())
+        return {"message": "accepted, new request raised for approved products", "request_id": new_req.request_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"partial response failed! {e}")
+        raise HTTPException(status_code=500, detail="could not submit response")
 
 
 @app.post("/allocation/create")
@@ -4532,12 +6638,7 @@ def create_allocation(request: CreateAllocationRequest, user: dict = Depends(req
                     model_no=item.model_no or None
                 )
             else:
-                allocated_serials = inventory_db.allocate_units(
-                    collection_name=INVENTORY_COLLECTION,
-                    product_id=item.product_id,
-                    quantity=item.quantity,
-                    model_no=item.model_no or None
-                )
+                allocated_serials = _auto_pick_units(inventory_db, item.product_id, item.quantity, item.model_no or None)
             for i in range(item.quantity):
                 serial = allocated_serials[i] if i < len(allocated_serials) else None
                 unit_allocation = allocation_manager(
@@ -4567,6 +6668,24 @@ def create_allocation(request: CreateAllocationRequest, user: dict = Depends(req
             if not existing_service:
                 raise HTTPException(status_code=404, detail="selected service not found")
 
+            # take the chosen item out of inventory (only when the caller said which one)
+            sp = request.spare_part
+            holograms = [h.strip() for h in sp.hologram_numbers if h and h.strip()]
+            try:
+                if holograms:
+                    if len(set(holograms)) != len(holograms):
+                        raise HTTPException(status_code=400, detail="duplicate hologram numbers selected")
+                    inventory_db.allocate_specific_holograms(INVENTORY_COLLECTION, holograms, product_name=sp.part_name)
+                    sp.quantity = len(holograms)
+                elif sp.lot_id:
+                    if sp.quantity <= 0:
+                        raise HTTPException(status_code=400, detail="quantity must be greater than 0")
+                    inventory_db.consume_from_lot(INVENTORY_COLLECTION, sp.lot_id, sp.quantity, product_name=sp.part_name)
+            except HTTPException:
+                raise
+            except Exception as inv_err:
+                raise HTTPException(status_code=400, detail=str(inv_err))
+
             svc_db.update_data(
                 collection_name=SERVICE_COLLECTION,
                 query={"service_id": request.spare_part.service_id},
@@ -4585,6 +6704,28 @@ def create_allocation(request: CreateAllocationRequest, user: dict = Depends(req
             )
             spare_allocation.add(collection_name=ALLOCATION_COLLECTION)
             created_allocation_ids.append(spare_allocation.allocation_id)
+
+            # fulfilling a technician's spare part request: close it once every requested part is issued
+            rid = (request.spare_part.request_id or "").strip()
+            if rid:
+                try:
+                    rdb = request_manager()
+                    found = rdb.get_data(collection_name=REQUESTS_COLLECTION, query={"request_id": rid})
+                    if found and found[0].get("request_type") == "spare_part" and found[0].get("status") == "pending":
+                        d = found[0].get("details") or {}
+                        wanted = len(d.get("parts") or []) or 1
+                        done = len(allocation_manager().get_data(
+                            collection_name=ALLOCATION_COLLECTION,
+                            query={"allocation_type": "spare_part", "spare_part.request_id": rid}))
+                        if done >= wanted:
+                            rdb.set_status(collection_name=REQUESTS_COLLECTION, request_id=rid,
+                                           status="approved", resolved_by=user["username"])
+                            _notify([found[0]["raised_by"]], kind="spare_part_allocated",
+                                    title="Spare part allocated",
+                                    body="Your requested spare part was allocated to you.",
+                                    service_id=request.spare_part.service_id, link="/pages/technician.html?tab=parts")
+                except Exception as close_err:
+                    logging.error(f"could not close spare part request {rid}: {close_err}")
 
         logging.info(f"allocation(s) created successfully: {created_allocation_ids}")
         return {"message": "allocation created successfully", "allocation_ids": created_allocation_ids, "redirect": redirect_to}
@@ -4614,7 +6755,7 @@ def _normalize_return_item(item):
 def _restock_one_item(inv_db, it):
     """Same product_id + name + model -> merged into that lot, else a new lot is created. Never gives up silently."""
     last_err = None
-    for _ in range(2):  # one retry for transient DB hiccups
+    for _ in range(2):  
         try:
             inv_db.restock_returned_units(
                 collection_name=INVENTORY_COLLECTION,
@@ -4670,6 +6811,7 @@ def return_allocation(allocation_id: str, user: dict = Depends(require_role("adm
 
         if is_spare:
             # spare parts were consumed by the service; only a damaged return goes back (as damaged stock)
+            
             sp = allocation.get("spare_part", {}) or {}
             part_name = sp.get("part_name", "")
             qty = sp.get("quantity", 0) or 0
@@ -4722,6 +6864,627 @@ def return_allocation(allocation_id: str, user: dict = Depends(require_role("adm
     except Exception as e:
         logging.error(f"marking allocation as returned failed! {e}")
         raise HTTPException(status_code=500, detail="return failed while updating inventory — nothing was lost, please retry")
+
+
+class EditAllocationRequest(BaseModel):
+    serial_numbers: Optional[List[str]] = None
+    company_name: Optional[str] = None
+    address: Optional[str] = None
+    gst_number: Optional[str] = None
+    phone_number: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+@app.post("/allocation/edit/{allocation_id}")
+def edit_allocation(allocation_id: str, request: EditAllocationRequest, user: dict = Depends(require_role("admin", "accounts"))):
+    """
+    Edit an allocation. Changing a serial number swaps stock: the new serial is deducted
+    from inventory, the old (auto-picked) serial goes back into inventory.
+    """
+    try:
+        db = allocation_manager()
+        found = db.get_data(collection_name=ALLOCATION_COLLECTION, query={"allocation_id": allocation_id})
+        if not found:
+            raise HTTPException(status_code=404, detail="allocation not found")
+        alloc = found[0]
+        if alloc.get("return_status") == "returned":
+            raise HTTPException(status_code=400, detail="a returned allocation cannot be edited")
+        if alloc.get("dispatch"):
+            raise HTTPException(status_code=400, detail="a dispatched allocation cannot be edited")
+
+        updates = {}
+        for f in ("company_name", "address", "gst_number", "phone_number", "remarks"):
+            v = getattr(request, f)
+            if v is not None:
+                updates[f] = v.strip()
+
+        history_entry = {"edited_by": user["username"], "edited_at": datetime.now(timezone.utc).isoformat()}
+
+        if request.serial_numbers is not None:
+            items = list(alloc.get("items") or [])
+            if alloc.get("allocation_type") == "spare_part" or len(items) != 1:
+                raise HTTPException(status_code=400, detail="serial numbers can only be edited on a single-product allocation")
+            it = _normalize_return_item(items[0])
+            new = list(dict.fromkeys(x.strip() for x in request.serial_numbers if x and x.strip()))
+            old = it["serial_numbers"]
+            if len(new) != it["quantity"]:
+                raise HTTPException(status_code=400, detail=f"select exactly {it['quantity']} serial number(s)")
+
+            removed = [x for x in old if x not in new]
+            added = [x for x in new if x not in old]
+            if added:
+                inv_db = inventory_manager()
+                model = it["model_no"] or None
+                available = set(inv_db.list_available_serials(INVENTORY_COLLECTION, it["product_id"], model_no=model))
+                missing = [x for x in added if x not in available]
+                if missing:
+                    raise HTTPException(status_code=400, detail=f"serial number(s) not available in inventory: {', '.join(missing)}")
+
+                # 1) take the new serial(s) out of inventory
+                inv_db.allocate_specific_serials(INVENTORY_COLLECTION, it["product_id"], added, model_no=model)
+                try:
+                    # 2) put the old serial(s) back (units that never had a serial go back by quantity)
+                    if removed:
+                        _restock_one_item(inv_db, {**it, "quantity": len(removed), "serial_numbers": removed})
+                    extra = len(added) - len(removed)
+                    if extra > 0:
+                        _restock_one_item(inv_db, {**it, "quantity": extra, "serial_numbers": []})
+                except Exception:
+                    # could not give the old stock back -> undo the new reservation so nothing is lost
+                    _restock_one_item(inv_db, {**it, "quantity": len(added), "serial_numbers": added})
+                    raise
+
+            items[0] = {**items[0], "serial_numbers": new}
+            updates["items"] = items
+            history_entry.update({"old_serials": old, "new_serials": new})
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="nothing to update")
+
+        updates.update({"last_edited_by": user["username"], "last_edited_at": history_entry["edited_at"],
+                        "edit_history": list(alloc.get("edit_history") or []) + [history_entry]})
+        db.update_data(collection_name=ALLOCATION_COLLECTION, query={"allocation_id": allocation_id}, update_values=updates)
+        return {"message": "allocation updated" + (" — old serial returned to inventory" if history_entry.get("old_serials") != history_entry.get("new_serials") and "new_serials" in history_entry else ""),
+                "allocation_id": allocation_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"editing allocation failed! {e}")
+        raise HTTPException(status_code=500, detail="allocation could not be updated")
+
+
+class AdminConvertRequest(BaseModel):
+    customer_id: str = ""          # set when an existing company was picked (no new company is created)
+    company_name: str = ""
+    company_address: str = ""
+    gst_number: str = ""
+    price: float
+    tax_rate: float = 0
+    invoice_no: str
+    invoice_date: str
+    payment_mode: str = ""
+    payment_details: dict = {}
+
+
+@app.post("/allocation/convert_to_order_direct/{allocation_id}")
+def convert_demo_to_order_direct(allocation_id: str, request: AdminConvertRequest, user: dict = Depends(require_role("admin", "accounts"))):
+    """Admin/accounts converts a dispatched demo unit straight into an order (no approval step)."""
+    try:
+        picked = None
+        if request.customer_id.strip():
+            rows = customer_manager().get_data(collection_name=CUSTOMER_COLLECTION, query={"customer_id": request.customer_id.strip()})
+            if not rows:
+                raise HTTPException(status_code=404, detail="selected company not found")
+            picked = rows[0]
+        elif not request.company_name.strip() or not request.company_address.strip():
+            raise HTTPException(status_code=400, detail="company name and address are required")
+        if request.price <= 0:
+            raise HTTPException(status_code=400, detail="enter a valid price")
+        if not request.invoice_no.strip() or not request.invoice_date.strip():
+            raise HTTPException(status_code=400, detail="invoice number and invoice date are required")
+
+        adb = allocation_manager()
+        matches = adb.get_data(collection_name=ALLOCATION_COLLECTION, query={"allocation_id": allocation_id})
+        if not matches:
+            raise HTTPException(status_code=404, detail="demo unit not found")
+        alloc = matches[0]
+        if alloc.get("allocation_type") == "spare_part" or not alloc.get("items"):
+            raise HTTPException(status_code=400, detail="spare part allocations cannot be converted to an order")
+        if alloc.get("return_status") == "returned":
+            raise HTTPException(status_code=400, detail="this allocation was already returned")
+        if (alloc.get("convert_request") or {}).get("status") == "pending":
+            raise HTTPException(status_code=400, detail="an order request is already pending — approve it from Pending Requests")
+        if (alloc.get("return_request") or {}).get("status") == "pending":
+            raise HTTPException(status_code=400, detail="a return request is pending for this demo unit")
+
+        if picked:
+            customer = {"customer_id": picked["customer_id"], "company_name": picked.get("company_name", ""),
+                        "company_address": picked.get("company_address", ""), "gst_number": picked.get("gst_number", "")}
+        else:
+            customer = {"company_name": request.company_name.strip(), "company_address": request.company_address.strip(),
+                        "gst_number": request.gst_number.strip()}
+        details = {"customer": customer, "price": request.price, "tax_rate": request.tax_rate}
+        order_id = _convert_demo_to_order(alloc, details, alloc.get("allocated_by") or user["username"], user["username"],
+                                          request.invoice_no.strip(), request.invoice_date.strip(),
+                                          request.payment_mode, request.payment_details)
+        return {"message": "demo unit converted to order", "order_id": order_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"direct convert to order failed! {e}")
+        raise HTTPException(status_code=500, detail="demo unit could not be converted to an order")
+
+
+MESSAGES_COLLECTION = params.get("messages_collection_name", "messages")
+
+
+class SendMessageRequest(BaseModel):
+    recipients: List[str]
+    body: str
+
+
+@app.get("/message/recipients")
+def message_recipients(user: dict = Depends(get_current_user)):
+    try:
+        db = mongodbclient()
+        dataset = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={})
+        users = [
+            {"username": a.get("username"), "name": a.get("name") or a.get("username"), "role": a.get("role")}
+            for a in dataset if a.get("username") and a.get("username") != user["username"]
+        ]
+        return {"message": "message recipients", "dataset": users}
+    except Exception:
+        logging.error("message recipients cannot be fetched")
+        raise HTTPException(status_code=500, detail="users cannot be fetched")
+
+
+@app.post("/message/send")
+def send_message(request: SendMessageRequest, user: dict = Depends(get_current_user)):
+    body = (request.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+    if len(body) > 2000:
+        raise HTTPException(status_code=400, detail="message is too long (max 2000 characters)")
+    recipients = list(dict.fromkeys(r for r in request.recipients if r and r != user["username"]))
+    if not recipients:
+        raise HTTPException(status_code=400, detail="select at least one recipient")
+    try:
+        db = mongodbclient()
+        accounts = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={"username": {"$in": recipients + [user["username"]]}})
+        valid = {a.get("username") for a in accounts}
+        targets = [r for r in recipients if r in valid]
+        if not targets:
+            raise HTTPException(status_code=404, detail="no valid recipients found")
+        sender = next((a for a in accounts if a.get("username") == user["username"]), {})
+        sender_name = sender.get("name") or user["username"]
+        batch_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        for target in targets:
+            db.add(collection_name=MESSAGES_COLLECTION, dictionary={
+                "message_id": uuid.uuid4().hex,
+                "batch_id": batch_id,
+                "from_username": user["username"],
+                "from_name": sender_name,
+                "from_role": user["role"],
+                "to_username": target,
+                "body": body,
+                "read": False,
+                "delivered": False,
+                "created_at": now,
+            })
+        logging.info(f"message sent by {user['username']} to {len(targets)} recipient(s)")
+        return {"message": "message sent", "sent": len(targets)}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("message could not be sent")
+        raise HTTPException(status_code=500, detail="message could not be sent")
+
+
+@app.get("/message/inbox")
+def message_inbox(user: dict = Depends(get_current_user)):
+    try:
+        db = mongodbclient()
+        dataset = db.get_data(collection_name=MESSAGES_COLLECTION, query={"to_username": user["username"]}, projection={"_id": 0})
+        dataset = sorted(dataset, key=lambda m: m.get("created_at") or "", reverse=True)[:100]
+        return {"message": "inbox", "dataset": dataset}
+    except Exception:
+        logging.error("inbox cannot be fetched")
+        raise HTTPException(status_code=500, detail="inbox cannot be fetched")
+
+
+@app.get("/message/all")
+def message_all(user: dict = Depends(require_role("admin"))):
+    try:
+        db = mongodbclient()
+        dataset = db.get_data(collection_name=MESSAGES_COLLECTION, query={}, projection={"_id": 0})
+        accounts = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={})
+        names = {a.get("username"): (a.get("name") or a.get("username")) for a in accounts}
+        for m in dataset:
+            m["to_name"] = names.get(m.get("to_username"), m.get("to_username"))
+        dataset = sorted(dataset, key=lambda m: m.get("created_at") or "", reverse=True)[:500]
+        return {"message": "all messages", "dataset": dataset}
+    except Exception:
+        logging.error("team messages cannot be fetched")
+        raise HTTPException(status_code=500, detail="team messages cannot be fetched")
+
+
+@app.post("/message/read/{message_id}")
+def message_mark_read(message_id: str, user: dict = Depends(get_current_user)):
+    try:
+        db = mongodbclient()
+        db.update_data(collection_name=MESSAGES_COLLECTION, query={"message_id": message_id, "to_username": user["username"]},
+                       update_values={"read": True})
+        return {"message": "marked as read"}
+    except Exception:
+        logging.error("message could not be marked as read")
+        raise HTTPException(status_code=500, detail="message could not be updated")
+
+
+@app.post("/message/read_all")
+def message_mark_all_read(user: dict = Depends(get_current_user)):
+    try:
+        db = mongodbclient()
+        unread = db.get_data(collection_name=MESSAGES_COLLECTION, query={"to_username": user["username"], "read": False}, projection={"_id": 0})
+        for m in unread:
+            db.update_data(collection_name=MESSAGES_COLLECTION, query={"message_id": m["message_id"], "to_username": user["username"]},
+                           update_values={"read": True})
+        return {"message": "all marked as read", "updated": len(unread)}
+    except Exception:
+        logging.error("messages could not be marked as read")
+        raise HTTPException(status_code=500, detail="messages could not be updated")
+
+
+def _chat_filter(me: str, other: str = None):
+    if other is None:
+        return {"$or": [{"from_username": me}, {"to_username": me}]}
+    return {"$or": [
+        {"from_username": me, "to_username": other},
+        {"from_username": other, "to_username": me},
+    ]}
+
+
+@app.get("/message/conversations")
+def message_conversations(user: dict = Depends(get_current_user)):
+    try:
+        me = user["username"]
+        db = mongodbclient()
+        msgs = db.get_data(collection_name=MESSAGES_COLLECTION, query=_chat_filter(me), projection={"_id": 0})
+        accounts = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={})
+        names = {a.get("username"): (a.get("name") or a.get("username")) for a in accounts}
+        roles = {a.get("username"): a.get("role") for a in accounts}
+        for m in msgs:
+            if m.get("to_username") == me and not m.get("delivered") and not m.get("read"):
+                db.update_data(collection_name=MESSAGES_COLLECTION,
+                               query={"message_id": m["message_id"], "to_username": me},
+                               update_values={"delivered": True})
+                m["delivered"] = True
+        convs = {}
+        for m in sorted(msgs, key=lambda x: x.get("created_at") or ""):
+            mine = m.get("from_username") == me
+            other = m.get("to_username") if mine else m.get("from_username")
+            c = convs.setdefault(other, {"username": other, "name": names.get(other, other),
+                                         "role": roles.get(other), "unread": 0, "last": None})
+            c["last"] = {"body": m.get("body"), "created_at": m.get("created_at"), "mine": mine,
+                         "read": bool(m.get("read")), "delivered": bool(m.get("delivered") or m.get("read"))}
+            if not mine and not m.get("read"):
+                c["unread"] += 1
+        dataset = sorted(convs.values(), key=lambda c: c["last"]["created_at"] or "", reverse=True)
+        return {"message": "conversations", "dataset": dataset}
+    except Exception:
+        logging.error("conversations cannot be fetched")
+        raise HTTPException(status_code=500, detail="conversations cannot be fetched")
+
+
+@app.get("/message/thread/{other}")
+def message_thread(other: str, user: dict = Depends(get_current_user)):
+    try:
+        me = user["username"]
+        db = mongodbclient()
+        msgs = db.get_data(collection_name=MESSAGES_COLLECTION, query=_chat_filter(me, other), projection={"_id": 0})
+        msgs = sorted(msgs, key=lambda m: m.get("created_at") or "")[-300:]
+        now = datetime.now(timezone.utc).isoformat()
+        for m in msgs:
+            if m.get("to_username") == me and not m.get("read"):
+                db.update_data(collection_name=MESSAGES_COLLECTION,
+                               query={"message_id": m["message_id"], "to_username": me},
+                               update_values={"read": True, "delivered": True, "read_at": now})
+                m["read"] = True
+                m["delivered"] = True
+                m["read_at"] = now
+            m["mine"] = m.get("from_username") == me
+            m["delivered"] = bool(m.get("delivered") or m.get("read"))
+        return {"message": "thread", "dataset": msgs}
+    except Exception:
+        logging.error("thread cannot be fetched")
+        raise HTTPException(status_code=500, detail="thread cannot be fetched")
+
+
+WORK_COLLECTION = params.get("work_collection_name", "work_assignments")
+WORK_STATUSES = {"open": "Open", "in_progress": "In Progress", "done": "Done"}
+WORK_PRIORITIES = {"low", "normal", "high", "urgent"}
+
+# Only these two usernames may assign / manage work (whatever their role is, even admin).
+# Everybody else can only receive work, reply and update its status.
+WORK_MANAGERS = {"prashant", "arun"}
+# an unfinished work pops up again on the assignee's screen after this many hours,
+# and keeps coming back every time this many hours pass, until it is marked Done
+WORK_REMIND_HOURS = 24
+
+
+def _is_work_manager(user) -> bool:
+    return str((user or {}).get("username") or "").strip().lower() in WORK_MANAGERS
+
+
+def require_work_manager(user: dict = Depends(get_current_user)):
+    if not _is_work_manager(user):
+        raise HTTPException(status_code=403, detail="Only Director can assign work")
+    return user
+
+
+def _work_parse_time(value):
+    try:
+        t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _work_popup_due(work, now) -> bool:
+    """True when the assignee must be shown this work's window right now."""
+    if work.get("status") == "done":
+        return False
+    if work.get("popup_pending"):
+        return True
+    last = _work_parse_time(work.get("last_popup_at") or work.get("seen_at") or work.get("created_at"))
+    return last is None or (now - last) >= timedelta(hours=WORK_REMIND_HOURS)
+
+
+class WorkAssignRequest(BaseModel):
+    assigned_to: str
+    title: str
+    description: Optional[str] = ""
+    priority: Optional[str] = "normal"
+    due_date: Optional[str] = None
+
+
+class WorkReplyRequest(BaseModel):
+    body: str
+
+
+class WorkStatusRequest(BaseModel):
+    status: str
+
+
+def _work_get(db, work_id: str):
+    found = db.get_data(collection_name=WORK_COLLECTION, query={"work_id": work_id}, projection={"_id": 0})
+    return found[0] if found else None
+
+
+def _work_user_name(db, username: str) -> str:
+    found = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={"username": username})
+    return (found[0].get("name") or username) if found else username
+
+
+def _work_check_access(work, user):
+    if not work:
+        raise HTTPException(status_code=404, detail="work not found")
+    if not _is_work_manager(user) and work.get("assigned_to") != user["username"]:
+        raise HTTPException(status_code=403, detail="you do not have permission for this action")
+
+
+@app.post("/work/assign")
+def work_assign(request: WorkAssignRequest, user: dict = Depends(require_work_manager)):
+    title = (request.title or "").strip()
+    description = (request.description or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="work title is required")
+    if len(title) > 120:
+        raise HTTPException(status_code=400, detail="title is too long (max 120 characters)")
+    if len(description) > 2000:
+        raise HTTPException(status_code=400, detail="description is too long (max 2000 characters)")
+    priority = request.priority if request.priority in WORK_PRIORITIES else "normal"
+    try:
+        db = mongodbclient()
+        target = db.get_data(collection_name=ACCOUNTS_COLLECTION, query={"username": request.assigned_to})
+        if not target:
+            raise HTTPException(status_code=404, detail="user not found")
+        if str(request.assigned_to).strip().lower() in WORK_MANAGERS:
+            raise HTTPException(status_code=400, detail="work cannot be assigned to a work manager")
+        now = datetime.now(timezone.utc).isoformat()
+        work_id = uuid.uuid4().hex
+        db.add(collection_name=WORK_COLLECTION, dictionary={
+            "work_id": work_id,
+            "title": title,
+            "description": description,
+            "priority": priority,
+            "due_date": request.due_date or None,
+            "assigned_to": request.assigned_to,
+            "assigned_to_name": target[0].get("name") or request.assigned_to,
+            "assigned_to_role": target[0].get("role"),
+            "assigned_by": user["username"],
+            "assigned_by_name": _work_user_name(db, user["username"]),
+            "status": "open",
+            "popup_pending": True,
+            "assignee_unread": True,
+            "admin_unread": False,
+            "seen_at": None,
+            "last_popup_at": None,
+            "replies": [],
+            "created_at": now,
+            "updated_at": now,
+        })
+        logging.info(f"work {work_id} assigned by {user['username']} to {request.assigned_to}")
+        return {"message": "work assigned", "work_id": work_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("work could not be assigned")
+        raise HTTPException(status_code=500, detail="work could not be assigned")
+
+
+@app.get("/work/all")
+def work_all(user: dict = Depends(require_work_manager)):
+    try:
+        db = mongodbclient()
+        dataset = db.get_data(collection_name=WORK_COLLECTION, query={}, projection={"_id": 0})
+        dataset.sort(key=lambda w: w.get("updated_at") or w.get("created_at") or "", reverse=True)
+        return {"message": "work list", "dataset": dataset}
+    except Exception:
+        logging.error("work list cannot be fetched")
+        raise HTTPException(status_code=500, detail="work list cannot be fetched")
+
+
+@app.get("/work/mine")
+def work_mine(user: dict = Depends(get_current_user)):
+    try:
+        db = mongodbclient()
+        dataset = db.get_data(collection_name=WORK_COLLECTION, query={"assigned_to": user["username"]}, projection={"_id": 0})
+        dataset.sort(key=lambda w: w.get("updated_at") or w.get("created_at") or "", reverse=True)
+        return {"message": "my work", "dataset": dataset}
+    except Exception:
+        logging.error("work cannot be fetched")
+        raise HTTPException(status_code=500, detail="work cannot be fetched")
+
+
+@app.get("/work/popup")
+def work_popup(user: dict = Depends(get_current_user)):
+    try:
+        db = mongodbclient()
+        if _is_work_manager(user):
+            return {"message": "work popup", "dataset": []}
+        now = datetime.now(timezone.utc)
+        dataset = db.get_data(collection_name=WORK_COLLECTION,
+                              query={"assigned_to": user["username"], "status": {"$ne": "done"}}, projection={"_id": 0})
+        due = []
+        for w in dataset:
+            if _work_popup_due(w, now):
+                # "reminder" = this window was already shown before and the work is still not done
+                w["popup_kind"] = "reminder" if w.get("last_popup_at") and not w.get("popup_pending") else "new"
+                due.append(w)
+        due.sort(key=lambda w: w.get("updated_at") or w.get("created_at") or "")
+        return {"message": "work popup", "dataset": due}
+    except Exception:
+        logging.error("work popup cannot be fetched")
+        raise HTTPException(status_code=500, detail="work popup cannot be fetched")
+
+
+@app.post("/work/{work_id}/seen")
+def work_seen(work_id: str, user: dict = Depends(get_current_user)):
+    try:
+        db = mongodbclient()
+        work = _work_get(db, work_id)
+        _work_check_access(work, user)
+        if not _is_work_manager(user):
+            now_iso = datetime.now(timezone.utc).isoformat()
+            db.update_data(collection_name=WORK_COLLECTION, query={"work_id": work_id},
+                           update_values={"popup_pending": False, "last_popup_at": now_iso,
+                                          "seen_at": work.get("seen_at") or now_iso})
+        return {"message": "work seen"}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("work seen could not be saved")
+        raise HTTPException(status_code=500, detail="work could not be updated")
+
+
+@app.get("/work/{work_id}")
+def work_detail(work_id: str, user: dict = Depends(get_current_user)):
+    try:
+        db = mongodbclient()
+        work = _work_get(db, work_id)
+        _work_check_access(work, user)
+        if _is_work_manager(user):
+            if work.get("admin_unread"):
+                db.update_data(collection_name=WORK_COLLECTION, query={"work_id": work_id}, update_values={"admin_unread": False})
+                work["admin_unread"] = False
+        elif work.get("assignee_unread") or not work.get("seen_at"):
+            seen = work.get("seen_at") or datetime.now(timezone.utc).isoformat()
+            db.update_data(collection_name=WORK_COLLECTION, query={"work_id": work_id},
+                           update_values={"assignee_unread": False, "seen_at": seen})
+            work["assignee_unread"] = False
+            work["seen_at"] = seen
+        return {"message": "work detail", "work": work}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("work detail cannot be fetched")
+        raise HTTPException(status_code=500, detail="work cannot be fetched")
+
+
+@app.post("/work/{work_id}/reply")
+def work_reply(work_id: str, request: WorkReplyRequest, user: dict = Depends(get_current_user)):
+    body = (request.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="reply cannot be empty")
+    if len(body) > 2000:
+        raise HTTPException(status_code=400, detail="reply is too long (max 2000 characters)")
+    try:
+        db = mongodbclient()
+        work = _work_get(db, work_id)
+        _work_check_access(work, user)
+        now = datetime.now(timezone.utc).isoformat()
+        replies = list(work.get("replies") or [])
+        replies.append({
+            "reply_id": uuid.uuid4().hex,
+            "type": "message",
+            "by": user["username"],
+            "by_name": _work_user_name(db, user["username"]),
+            "by_role": user["role"],
+            "body": body,
+            "created_at": now,
+        })
+        update = {"replies": replies, "updated_at": now}
+        if _is_work_manager(user):
+            update["popup_pending"] = True
+            update["assignee_unread"] = True
+        else:
+            update["admin_unread"] = True
+            if work.get("status") == "open":
+                update["status"] = "in_progress"
+        db.update_data(collection_name=WORK_COLLECTION, query={"work_id": work_id}, update_values=update)
+        return {"message": "reply sent"}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("work reply could not be sent")
+        raise HTTPException(status_code=500, detail="reply could not be sent")
+
+
+@app.post("/work/{work_id}/status")
+def work_status(work_id: str, request: WorkStatusRequest, user: dict = Depends(get_current_user)):
+    if request.status not in WORK_STATUSES:
+        raise HTTPException(status_code=400, detail="invalid status")
+    try:
+        db = mongodbclient()
+        work = _work_get(db, work_id)
+        _work_check_access(work, user)
+        now = datetime.now(timezone.utc).isoformat()
+        name = _work_user_name(db, user["username"])
+        replies = list(work.get("replies") or [])
+        replies.append({
+            "reply_id": uuid.uuid4().hex,
+            "type": "system",
+            "by": user["username"],
+            "by_name": name,
+            "by_role": user["role"],
+            "body": f"{name} marked this work as {WORK_STATUSES[request.status]}",
+            "created_at": now,
+        })
+        update = {"status": request.status, "replies": replies, "updated_at": now}
+        if work.get("status") == "done" and request.status != "done":
+            update["last_popup_at"] = now      # reopened: the 24 hour reminder clock starts again
+        if _is_work_manager(user):
+            update["assignee_unread"] = True
+        else:
+            update["admin_unread"] = True
+        db.update_data(collection_name=WORK_COLLECTION, query={"work_id": work_id}, update_values=update)
+        return {"message": "status updated"}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.error("work status could not be updated")
+        raise HTTPException(status_code=500, detail="status could not be updated")
 
 
 app.mount("/css", StaticFiles(directory=os.path.join(BASE_DIR, "css")), name="css")

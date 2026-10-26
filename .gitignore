@@ -11,3 +11,5 @@ dist/
 build/
 main.js
 node_modules/
+notrace/
+venv_old/
