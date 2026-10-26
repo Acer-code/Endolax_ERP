@@ -1,5 +1,5 @@
 {
-  "name": "ABM-erp",
+  "name": "Endolax-erp",
   "version": "1.0.0",
   "main": "main.js",
   "scripts": {
@@ -11,8 +11,8 @@
       "package.json",
       "build/**/*"
     ],
-    "appId": "com.ABM.erp",
-    "productName": "ABM ERP",
+    "appId": "com.Endolax.erp",
+    "productName": "Endolax ERP",
     "icon": "build/icon.ico",
     "win": {
       "target": "nsis",

@@ -1,8 +1,8 @@
 {
     "id": "/main_dashboard.html",
-    "name": "Acer Biomedical ERP",
-    "short_name": "ABM ERP",
-    "description": "Acer Biomedical ERP",
+    "name": "Endolax ERP",
+    "short_name": "Endolax ERP",
+    "description": "Endolax ERP",
     "start_url": "/main_dashboard.html",
     "scope": "/",
     "display": "standalone",
