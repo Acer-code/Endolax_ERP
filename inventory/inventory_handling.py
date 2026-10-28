@@ -12,9 +12,12 @@ class inventory_manager(mongodbclient):
                  model_no=None, supplier_address=None, serial_numbers=None, product_type=None,
                  warranty_until=None, reason="",
                  parent_product_name="", part_category=None, hologram_numbers=None,
-                 created_by=None, invoice_no=""):
+                 created_by=None, invoice_no="", serial_lots=None):
 
         super().__init__()
+
+        self.serial_lots = list(serial_lots or [])
+        self.taken_lots = {}
 
         self.product_name = product_name
         self.product_id = product_id
@@ -66,6 +69,8 @@ class inventory_manager(mongodbclient):
                 "created_by": self.created_by,
                 "updated_by": self.created_by,
             }
+            if self.serial_lots:
+                product_dic["serial_lots"] = self.serial_lots
             if self.product_type in ("spare_parts", "service_parts"):
                 product_dic["parent_product_name"] = self.parent_product_name
                 product_dic["part_category"] = self.part_category
@@ -90,7 +95,7 @@ class inventory_manager(mongodbclient):
         Category-change-by-serial: if a serial number being added here is
         already on file under a *different* product_type entry anywhere in
         inventory, that unit is pulled out of its old entry (1 unit + that
-        serial removed, entry deleted if it hits zero) and lands in the
+        serial removed, entry kept at 0 if it hits zero) and lands in the
         product_type being added now. This is how a unit gets flagged
         faulty (product_type="damaged") when it's re-added as damaged even
         though it was previously a product/spare_parts/service_parts/
@@ -130,14 +135,12 @@ class inventory_manager(mongodbclient):
                     owner_serials = owner.get("serial_numbers") or []
                     remaining_serials = [s for s in owner_serials if s != serial]
                     new_owner_quantity = max(int(owner.get("quantity", 0) or 0) - 1, 0)
-                    if remaining_serials or new_owner_quantity > 0:
-                        self.update_data(
-                            collection_name=collection_name,
-                            query={"_id": ObjectId(owner["_id"])},
-                            update_values={"serial_numbers": remaining_serials, "quantity": new_owner_quantity}
-                        )
-                    else:
-                        self.delete_data(collection_name=collection_name, query={"_id": ObjectId(owner["_id"])})
+                    # keep the old entry even when it drops to 0 (never auto-deleted)
+                    self.update_data(
+                        collection_name=collection_name,
+                        query={"_id": ObjectId(owner["_id"])},
+                        update_values={"serial_numbers": remaining_serials, "quantity": new_owner_quantity}
+                    )
                     logging.info(
                         f"serial {serial} moved out of '{owner.get('product_type', 'product')}' "
                         f"into '{self.product_type}'"
@@ -165,6 +168,8 @@ class inventory_manager(mongodbclient):
                     "purchase_date": self.purchase_date,
                     "updated_by": self.created_by,
                 }
+                if self.serial_lots:
+                    update_values["serial_lots"] = (entry.get("serial_lots") or []) + self.serial_lots
                 self.update_data(
                     collection_name=collection_name,
                     query={"_id": ObjectId(entry["_id"])},
@@ -222,7 +227,19 @@ class inventory_manager(mongodbclient):
             logging.error("adding spare/service part failed!")
             raise Exception(e)
 
-    def restock_returned_units(self, collection_name, product_id, product_name, model_no, quantity, serial_numbers=None):
+    def _take_lots(self, entry, serials):
+        lots = {x.get("serial_number"): x.get("lot_no") for x in (entry.get("serial_lots") or [])}
+        for sn in serials:
+            self.taken_lots[sn] = lots.get(sn) or (entry.get("lot_no") or "")
+        if "serial_lots" not in entry:
+            return {}
+        gone = set(serials)
+        return {"serial_lots": [x for x in (entry.get("serial_lots") or []) if x.get("serial_number") not in gone]}
+
+    def lots_for(self, serials):
+        return [{"serial_number": sn, "lot_no": self.taken_lots.get(sn, "")} for sn in (serials or []) if sn]
+
+    def restock_returned_units(self, collection_name, product_id, product_name, model_no, quantity, serial_numbers=None, serial_lots=None):
         """
         Used when a previously allocated (undamaged) unit is returned and needs
         to go back into inventory. Adds `quantity` back onto the lot that
@@ -251,7 +268,7 @@ class inventory_manager(mongodbclient):
             # is exactly how a return used to end up creating a second,
             # separate inventory document instead of merging into the old
             # one. Match null/missing the same way "" is matched instead.
-            query = {"product_id": product_id, "product_name": product_name}
+            query = {"product_name": product_name}   # product_id is not part of a product's identity
             if model_no:
                 query["model_no"] = model_no
             else:
@@ -278,7 +295,8 @@ class inventory_manager(mongodbclient):
                 self.update_data(
                     collection_name=collection_name,
                     query={"_id": ObjectId(entry["_id"])},
-                    update_values={"serial_numbers": merged_serials, "quantity": new_quantity}
+                    update_values={"serial_numbers": merged_serials, "quantity": new_quantity,
+                                   **({"serial_lots": (entry.get("serial_lots") or []) + [x for x in serial_lots if x.get("serial_number") in set(merged_serials) - set(current_serials)]} if serial_lots else {})}
                 )
                 logging.info(f"restocked {quantity} returned unit(s) into existing inventory entry for {product_id}")
                 return {"mode": "merged", "product_id": product_id, "quantity_added": quantity}
@@ -296,6 +314,7 @@ class inventory_manager(mongodbclient):
                 tax_rate=0,
                 serial_numbers=list(serial_numbers or []),
                 product_type="product",
+                serial_lots=serial_lots,
             )
             logging.info(f"original lot for {product_id} no longer exists — created fallback entry for returned stock")
             return fallback.add(collection_name=collection_name)
@@ -306,16 +325,11 @@ class inventory_manager(mongodbclient):
 
     def update(self, collection_name, query, update_values, many=False):
         try:
-            # if this update sets quantity down to 0 (or below), delete the
-            # entry outright instead of leaving an empty/zero-quantity row
-            # behind — covers manual edits (e.g. the admin edit form) that
-            # set quantity directly, as opposed to the allocate/consume
-            # paths below which decrement it themselves.
+            # a quantity of 0 (or below) is kept as a 0-quantity row - the entry is NOT deleted
+            # automatically. Only the explicit "delete product" action removes an inventory row.
             new_quantity = update_values.get("quantity")
             if new_quantity is not None and int(new_quantity or 0) <= 0:
-                deleted = super().delete_data(collection_name=collection_name, query=query)
-                logging.info("quantity reached 0 — inventory entry deleted instead of updated")
-                return deleted
+                update_values = dict(update_values, quantity=0)
 
             data = super().update_data(collection_name=collection_name, query=query,
                                          update_values=update_values, many=many)
@@ -328,21 +342,22 @@ class inventory_manager(mongodbclient):
     def _decrement_or_delete(self, collection_name, entry_id, new_quantity, extra_update_values=None):
         """
         Shared by every allocate/consume path below: applies a quantity
-        decrement to the entry at entry_id. If the resulting quantity is 0
-        (or less), the entry is deleted outright instead of being left
-        behind as a zero-quantity row. extra_update_values (e.g. an updated
-        serial_numbers/hologram_numbers list) are applied alongside quantity
-        when the entry survives; they're moot when it's deleted along with it.
+        decrement to the entry at entry_id. When the resulting quantity is 0
+        (or less) the entry is KEPT as a 0-quantity row (never auto-deleted) -
+        it is simply not eligible for allocation (every allocator filters
+        quantity > 0) and shows as out of stock. extra_update_values (e.g. an
+        updated serial_numbers/hologram_numbers list) are applied alongside.
         """
-        if new_quantity <= 0:
-            self.delete_data(collection_name=collection_name, query={"_id": ObjectId(entry_id)})
-            logging.info(f"quantity reached 0 for entry {entry_id} — deleted from inventory")
-        else:
-            update_values = {"quantity": new_quantity}
-            if extra_update_values:
-                update_values.update(extra_update_values)
-            self.update_data(collection_name=collection_name, query={"_id": ObjectId(entry_id)},
-                              update_values=update_values)
+        new_quantity = max(int(new_quantity or 0), 0)
+        update_values = {"quantity": new_quantity}
+        if extra_update_values:
+            update_values.update(extra_update_values)
+        if new_quantity == 0 and "serial_numbers" in update_values:
+            update_values["serial_numbers"] = []   # nothing left in stock -> no stray serials
+        self.update_data(collection_name=collection_name, query={"_id": ObjectId(entry_id)},
+                          update_values=update_values)
+        if new_quantity == 0:
+            logging.info(f"quantity reached 0 for entry {entry_id} — kept in inventory as out of stock")
 
     def get_data(self, collection_name, query=None, projection=None, sort=None, skip=None, limit=None):
         try:
@@ -382,14 +397,12 @@ class inventory_manager(mongodbclient):
             logging.error("product deletion was unsuccessful")
             raise Exception(e)
 
-    def get_available_quantity(self, collection_name, product_id, model_no=None):
+    def get_available_quantity(self, collection_name, product_id, model_no=None, product_name=None, product_type=None):
         try:
-            query = {"product_id": product_id, "product_type": {"$ne": "damaged"}}
+            query = self._identity_query(product_id, product_name, model_no, product_type)
             # model_no disambiguates between variants sharing the same product_id
             # (e.g. black vs grey) — only filter by it when one was actually given,
             # so callers that intentionally want the product_id-wide total still can
-            if model_no is not None:
-                query["model_no"] = self._model_query(model_no)
             entries = self.get_data(collection_name=collection_name, query=query)
             return sum(int(e.get("quantity", 0) or 0) for e in entries)
         except Exception as e:
@@ -492,8 +505,8 @@ class inventory_manager(mongodbclient):
         assembly is edited and fewer parts are needed than were first deducted.
 
         The units go back into the newest existing lot for that product_name +
-        product_type. If every lot was already used up (and therefore deleted
-        by _decrement_or_delete), a fresh lot is created instead.
+        product_type. Used-up lots stay as 0-quantity rows, so they are reused;
+        a fresh lot is only created when none exists at all.
         """
         try:
             quantity = int(quantity or 0)
@@ -669,10 +682,43 @@ class inventory_manager(mongodbclient):
 
     @staticmethod
     def _model_query(model_no):
-        """model_no "" / None both mean "no variant" — old lots store null, not ""."""
-        return model_no if model_no else {"$in": [None, ""]}
+        """model_no "" / None both mean "no variant" — old lots store null, not "".
+        A given model_no is matched ignoring case and leading/trailing spaces, so a request
+        raised with "XY-100" still finds a lot that was later saved as "xy-100 " (this
+        mismatch used to show up as a false "out of stock")."""
+        if not model_no or not str(model_no).strip():
+            return {"$in": [None, ""]}
+        return {"$regex": "^\\s*" + re.escape(str(model_no).strip()) + "\\s*$", "$options": "i"}
 
-    def list_available_serials(self, collection_name, product_id, model_no=None):
+    @staticmethod
+    def _text_query(value):
+        """Case-insensitive match ignoring leading/trailing spaces."""
+        return {"$regex": "^\\s*" + re.escape(str(value).strip()) + "\\s*$", "$options": "i"}
+
+    def _identity_query(self, product_id, product_name=None, model_no=None, product_type=None):
+        """Which inventory lots count as "the same product".
+        With a product_name the identity is product name + model no + product type -
+        product_id is deliberately NOT used (inventory products now all carry a blank / single-space
+        id, so it can't tell products apart and a mismatch caused false "out of stock").
+        model_no "" / None = no variant. product_type "" / None = any live (non-damaged) type;
+        "product" also matches older lots that have no product_type saved.
+        Callers that only have a product_id (no name) keep the old product_id matching."""
+        if product_name and str(product_name).strip():
+            q = {"product_name": self._text_query(product_name), "model_no": self._model_query(model_no)}
+        else:
+            q = {"product_id": product_id}
+            if model_no is not None:
+                q["model_no"] = self._model_query(model_no)
+        t = (product_type or "").strip()
+        if t == "product":
+            q["product_type"] = {"$in": [None, "", "product"]}
+        elif t:
+            q["product_type"] = t
+        else:
+            q["product_type"] = {"$ne": "damaged"}
+        return q
+
+    def list_available_serials(self, collection_name, product_id, model_no=None, product_name=None, product_type=None):
         """
         Returns every serial number currently on file for product_id (optionally
         scoped to a single model_no variant), oldest lot first — the exact same
@@ -684,23 +730,26 @@ class inventory_manager(mongodbclient):
         try:
             # damaged lots share product_id/model_no with the live lot — they must
             # never show up as available (that was leaking faulty serials into orders)
-            query = {"product_id": product_id, "quantity": {"$gt": 0}, "product_type": {"$ne": "damaged"}}
-            if model_no is not None:
-                query["model_no"] = self._model_query(model_no)
+            query = self._identity_query(product_id, product_name, model_no, product_type)
+            query["quantity"] = {"$gt": 0}
             entries = self.get_data(collection_name=collection_name, query=query)
             entries.sort(key=lambda e: e.get("purchase_date") or "")
             serials, seen = [], set()
             for entry in entries:
-                for s in (entry.get("serial_numbers") or []):
-                    if s not in seen:
-                        seen.add(s)
+                # a lot can never hand out more serials than it has units: stale lots that list
+                # more serials than `quantity` would otherwise leak phantom (extra) serials
+                lot_qty = int(entry.get("quantity", 0) or 0)
+                for s in (entry.get("serial_numbers") or [])[:lot_qty]:
+                    key = str(s).strip().lower()
+                    if key not in seen:
+                        seen.add(key)
                         serials.append(s)
             return serials
         except Exception as e:
             logging.error("listing available serial numbers failed!")
             raise Exception(e)
 
-    def allocate_specific_serials(self, collection_name, product_id, serial_numbers, model_no=None):
+    def allocate_specific_serials(self, collection_name, product_id, serial_numbers, model_no=None, product_name=None, product_type=None):
         """
         Deducts exactly the given serial_numbers (a manual/reviewed selection
         from the order UI, as opposed to allocate_serials' auto oldest-first
@@ -718,22 +767,26 @@ class inventory_manager(mongodbclient):
         elsewhere (e.g. allocate_serials/allocate_units).
         """
         try:
-            query = {"product_id": product_id, "quantity": {"$gt": 0}, "product_type": {"$ne": "damaged"}}
-            if model_no is not None:
-                query["model_no"] = self._model_query(model_no)
+            query = self._identity_query(product_id, product_name, model_no, product_type)
+            query["quantity"] = {"$gt": 0}
             entries = self.get_data(collection_name=collection_name, query=query)
 
             allocated = []
             for serial in serial_numbers:
-                match = next((e for e in entries if serial in (e.get("serial_numbers") or [])), None)
+                # only lots that still have stock left in THIS call (a lot emptied by an earlier
+                # serial is already deleted - it must not be matched / decremented again)
+                match = next((e for e in entries
+                              if int(e.get("quantity", 0) or 0) > 0 and serial in (e.get("serial_numbers") or [])), None)
                 if not match:
                     variant_note = f" (model {model_no})" if model_no else ""
                     raise Exception(f"serial number {serial} is not available for product {product_id}{variant_note}")
 
                 leftover_serials = [s for s in (match.get("serial_numbers") or []) if s != serial]
                 new_quantity = int(match.get("quantity", 0) or 0) - 1
+                lot_update = self._take_lots(match, [serial])
                 self._decrement_or_delete(collection_name, match["_id"], new_quantity,
-                                           {"serial_numbers": leftover_serials})
+                                           {"serial_numbers": leftover_serials, **lot_update})
+                match.update(lot_update)
                 # keep our local view in sync so two requested serials from the
                 # same lot in one call don't both match the stale entry
                 match["serial_numbers"] = leftover_serials
@@ -802,7 +855,60 @@ class inventory_manager(mongodbclient):
             logging.error("serial allocation failed!")
             raise Exception(e)
 
-    def allocate_units(self, collection_name, product_id, quantity, model_no=None):
+    def unserialised_quantity(self, collection_name, product_id, model_no=None, product_name=None, product_type=None):
+        """
+        Units in stock that are NOT backed by a serial number on file: for every live lot,
+        quantity minus the serials listed on it (never below 0). A lot with quantity 5 and
+        2 serials on file has 3 such units. Used so a partially serialised lot is not
+        reported as "short" when only its serial list is shorter than its quantity.
+        """
+        try:
+            query = self._identity_query(product_id, product_name, model_no, product_type)
+            query["quantity"] = {"$gt": 0}
+            entries = self.get_data(collection_name=collection_name, query=query)
+            total = 0
+            for e in entries:
+                qty = int(e.get("quantity", 0) or 0)
+                total += max(0, qty - len(e.get("serial_numbers") or []))
+            return total
+        except Exception as e:
+            logging.error("counting unserialised units failed!")
+            raise Exception(e)
+
+    def allocate_unserialised_units(self, collection_name, product_id, quantity, model_no=None, product_name=None, product_type=None):
+        """
+        Deducts `quantity` units that have no serial number on file (see unserialised_quantity),
+        oldest lot first. Only the lot quantity goes down - serial numbers listed on a lot are
+        never touched, so serials that were skipped (e.g. already sold) stay exactly as they are.
+        Raises if there are fewer such units than requested.
+        """
+        try:
+            query = self._identity_query(product_id, product_name, model_no, product_type)
+            query["quantity"] = {"$gt": 0}
+            entries = self.get_data(collection_name=collection_name, query=query)
+            entries.sort(key=lambda e: e.get("purchase_date") or "")
+
+            remaining = quantity
+            for entry in entries:
+                if remaining <= 0:
+                    break
+                qty = int(entry.get("quantity", 0) or 0)
+                free = qty - len(entry.get("serial_numbers") or [])
+                take = min(remaining, free)
+                if take <= 0:
+                    continue
+                self._decrement_or_delete(collection_name, entry["_id"], qty - take)
+                remaining -= take
+
+            if remaining > 0:
+                variant_note = f" (model {model_no})" if model_no else ""
+                raise Exception(f"insufficient un-serialised stock for product {product_id}{variant_note}, short by {remaining}")
+            logging.info(f"allocated {quantity} un-serialised unit(s) for product {product_id}")
+        except Exception as e:
+            logging.error("un-serialised unit allocation failed!")
+            raise Exception(e)
+
+    def allocate_units(self, collection_name, product_id, quantity, model_no=None, product_name=None, product_type=None):
         """
         Deducts `quantity` units of product_id from inventory (oldest lots first) —
         for use anywhere a full quantity+serials list is recorded together (e.g. an
@@ -828,9 +934,8 @@ class inventory_manager(mongodbclient):
         all matching lots is insufficient.
         """
         try:
-            query = {"product_id": product_id, "quantity": {"$gt": 0}, "product_type": {"$ne": "damaged"}}
-            if model_no is not None:
-                query["model_no"] = self._model_query(model_no)
+            query = self._identity_query(product_id, product_name, model_no, product_type)
+            query["quantity"] = {"$gt": 0}
             entries = self.get_data(
                 collection_name=collection_name,
                 query=query
@@ -854,8 +959,9 @@ class inventory_manager(mongodbclient):
                 taken_serials = available_serials[:serial_take]
                 leftover_serials = available_serials[serial_take:]
 
+                lot_update = self._take_lots(entry, taken_serials)
                 self._decrement_or_delete(collection_name, entry["_id"], available_qty - take,
-                                           {"serial_numbers": leftover_serials})
+                                           {"serial_numbers": leftover_serials, **lot_update})
 
                 allocated.extend(taken_serials)
                 remaining -= take
@@ -956,61 +1062,6 @@ class inventory_manager(mongodbclient):
 
         except Exception as e:
             logging.error("pushing assembled units into inventory failed!")
-            raise Exception(e)
-
-    def add_product_from_shipment(self, collection_name, product_name, serial_numbers,
-                                  supplier="", supplier_address="", purchase_date=None, invoice_no="", created_by=None):
-        try:
-            name = (product_name or "").strip()
-            serials = list(dict.fromkeys(str(s).strip() for s in (serial_numbers or []) if str(s).strip()))
-            if not name or not serials:
-                return None
-
-            taken = self.get_data(collection_name=collection_name,
-                                  query={"serial_numbers": {"$in": serials}, "product_type": "product"})
-            owned = {s for e in taken for s in (e.get("serial_numbers") or [])}
-            clash = [s for s in serials if s in owned]
-            if clash:
-                raise Exception(f"serial number(s) already in inventory: {', '.join(clash)}")
-
-            existing = self.get_data(
-                collection_name=collection_name,
-                query={"product_name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}, "product_type": "product"}
-            )
-            if existing:
-                entry = existing[0]
-                self.update_data(
-                    collection_name=collection_name,
-                    query={"_id": ObjectId(entry["_id"])},
-                    update_values={"serial_numbers": (entry.get("serial_numbers") or []) + serials,
-                                   "quantity": int(entry.get("quantity", 0) or 0) + len(serials),
-                                   "updated_by": created_by}
-                )
-                return {"part_name": name, "mode": "merged", "quantity_added": len(serials)}
-
-            product_dic = {
-                "product_name": name,
-                "product_id": f"SH-{uuid.uuid4().hex[:8].upper()}",
-                "lot_no": "",
-                "supplier": supplier,
-                "supplier_address": supplier_address,
-                "invoice_no": invoice_no or "",
-                "price": 0,
-                "tax_rate": 0,
-                "purchase_date": purchase_date,
-                "quantity": len(serials),
-                "model_no": "",
-                "serial_numbers": serials,
-                "product_type": "product",
-                "warranty_until": None,
-                "reason": "",
-                "created_by": created_by,
-                "updated_by": created_by,
-            }
-            super().add(collection_name=collection_name, dictionary=product_dic)
-            return {"part_name": name, "mode": "created", "quantity_added": len(serials)}
-        except Exception as e:
-            logging.error("pushing shipment product into inventory failed!")
             raise Exception(e)
 
     def add_from_shipment_parts(self, collection_name, parts, product_type,
