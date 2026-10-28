@@ -7,6 +7,32 @@ from datetime import timedelta
 PAYMENT_MODES = ("paid", "partial", "credit")
 
 
+def split_serials(values):
+    if isinstance(values, str):
+        values = values.replace("\n", ",").split(",")
+    return [str(v).strip() for v in (values or []) if str(v).strip()]
+
+
+def validate_shipment_serials(products):
+    seen = set()
+
+    def check(label, qty, serials):
+        if qty <= 0 or len(serials) != qty:
+            raise ValueError(f"{label}: enter exactly {qty} serial number(s), found {len(serials)}")
+        for s in serials:
+            if s in seen:
+                raise ValueError(f"serial number '{s}' is repeated in this shipment")
+            seen.add(s)
+
+    for product in products:
+        name = product.get("product_name") or "product"
+        check(f"'{name}'", int(product.get("quantity") or 0), split_serials(product.get("serial_numbers")))
+        for part in product.get("parts") or []:
+            if part.get("status") == "product":
+                serials = split_serials(part.get("serial_numbers"))
+                check(f"part '{part.get('part_name')}' of '{name}'", len(serials), serials)
+
+
 def compute_payment(mode, total, paid_amount=0, credit_days=0, base_date=None):
     """
     Normalises a payment choice into the fields stored on a shipment / purchase:
@@ -90,12 +116,14 @@ class shipment_manager(mongodbclient):
                 if not part_name:
                     continue
                 status = part.get("status", "assembly")
-                if status not in ("assembly", "purchase", "warranty"):
+                if status not in ("assembly", "purchase", "warranty", "product"):
                     status = "assembly"
+                part_serials = split_serials(part.get("serial_numbers")) if status == "product" else []
                 parts.append({
                     "part_name": part_name,
-                    "quantity": part.get("quantity", 0) or 0,
+                    "quantity": len(part_serials) if status == "product" else (part.get("quantity", 0) or 0),
                     "status": status,
+                    "serial_numbers": part_serials,
                 })
 
             normalized.append({
@@ -104,6 +132,7 @@ class shipment_manager(mongodbclient):
                 "price": price,
                 "line_total": price * quantity,
                 "warranty": product.get("warranty", "") or "",
+                "serial_numbers": split_serials(product.get("serial_numbers")),
                 "parts": parts,
             })
         return normalized

@@ -17,7 +17,7 @@ from user.customer_details import customer_manager
 from sales.sales_person_manager import sales_person_manager
 from allocation.allocation import allocation_manager
 from request.request_manager import request_manager
-from shipment.manage_shipment import shipment_manager, compute_payment
+from shipment.manage_shipment import shipment_manager, compute_payment, validate_shipment_serials, split_serials
 from assembly.manage_assembly import assembly_manager
 from auth import create_access_token, get_current_user, require_role, invalidate_access_cache, _borrowed_roles
 from fastapi.responses import FileResponse,RedirectResponse
@@ -452,7 +452,8 @@ class InventoryUpdateRequest(BaseModel):
 class ShipmentPart(BaseModel):
     part_name: str
     quantity: int = 0
-    status: str = "assembly"      # "assembly" (-> inventory spare_parts) | "purchase" | "warranty" (both -> inventory service_parts)
+    status: str = "assembly"      # "assembly" (-> inventory spare_parts) | "purchase" | "warranty" (both -> inventory service_parts) | "product" (-> inventory product, serials required)
+    serial_numbers: list[str] = []
 
 
 class ShipmentProduct(BaseModel):
@@ -460,6 +461,7 @@ class ShipmentProduct(BaseModel):
     quantity: int = 0
     price: float = 0
     warranty: str = ""            # e.g. "12 months" - optional
+    serial_numbers: list[str] = []
     parts: list[ShipmentPart] = []
 
 
@@ -1743,6 +1745,7 @@ def sync_shipment_parts_to_inventory(shipment: dict, received_date: str):
     them as "under warranty" / "over warranty".
     Non-fatal: caller decides what to do if this raises / returns a failure.
     """
+    product_parts_needed = {}
     spare_parts_needed = {}      # (product_name, part_name) -> {"quantity": qty, "warranty_until": date|None}
     purchase_parts_needed = {}   # (product_name, part_name) -> total qty
     warranty_parts_needed = {}   # (product_name, part_name) -> {"quantity": qty, "warranty_until": date|None}
@@ -1758,7 +1761,10 @@ def sync_shipment_parts_to_inventory(shipment: dict, received_date: str):
             status = part.get("status", "assembly")
             key = (parent_product_name, name)
 
-            if status == "assembly":
+            if status == "product":
+                slot = product_parts_needed.setdefault(name.lower(), {"name": name, "serials": []})
+                slot["serials"] += [x for x in split_serials(part.get("serial_numbers")) if x not in slot["serials"]]
+            elif status == "assembly":
                 entry = spare_parts_needed.setdefault(key, {"quantity": 0, "warranty_until": None})
                 entry["quantity"] += qty
                 if product_warranty_until and (not entry["warranty_until"] or product_warranty_until > entry["warranty_until"]):
@@ -1771,11 +1777,24 @@ def sync_shipment_parts_to_inventory(shipment: dict, received_date: str):
                 if product_warranty_until and (not entry["warranty_until"] or product_warranty_until > entry["warranty_until"]):
                     entry["warranty_until"] = product_warranty_until
 
-    if not (spare_parts_needed or purchase_parts_needed or warranty_parts_needed):
+    if not (spare_parts_needed or purchase_parts_needed or warranty_parts_needed or product_parts_needed):
         return "no_parts"
 
     inv_db = inventory_manager()
     sync_results = []
+    for slot in product_parts_needed.values():
+        res = inv_db.add_product_from_shipment(
+            collection_name=INVENTORY_COLLECTION,
+            product_name=slot["name"],
+            serial_numbers=slot["serials"],
+            supplier=shipment.get("company_name", ""),
+            supplier_address=shipment.get("company_address", ""),
+            purchase_date=received_date,
+            invoice_no=shipment.get("invoice_no", "") or "",
+            created_by=shipment.get("created_by"),
+        )
+        if res:
+            sync_results.append(res)
     if spare_parts_needed:
         sync_results += inv_db.add_from_shipment_parts(
             collection_name=INVENTORY_COLLECTION,
@@ -1977,6 +1996,16 @@ def create_shipment(request: CreateShipmentRequest, user: dict = Depends(require
             "invoice_no": (request.invoice_no or "").strip(),
             "products": [product.dict() for product in request.products],
         }
+        try:
+            validate_shipment_serials(shipment_dict["products"])
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        all_serials = [x for p in shipment_dict["products"] for x in split_serials(p.get("serial_numbers"))]
+        all_serials += [x for p in shipment_dict["products"] for pt in p.get("parts", []) if pt.get("status") == "product" for x in split_serials(pt.get("serial_numbers"))]
+        owned = inventory_manager().get_data(collection_name=INVENTORY_COLLECTION, query={"serial_numbers": {"$in": all_serials}, "product_type": "product"})
+        clash = sorted({x for e in owned for x in (e.get("serial_numbers") or []) if x in all_serials})
+        if clash:
+            raise HTTPException(status_code=400, detail=f"serial number(s) already in inventory: {', '.join(clash[:10])}")
         shipment_item = shipment_manager(
             company_name=request.company_name,
             company_address=request.company_address,
@@ -2066,6 +2095,11 @@ def update_shipment(shipment_id: str, request: ShipmentUpdateRequest, user: dict
             raise HTTPException(status_code=404, detail="no shipment found with this shipment_id")
 
         updated = dict(request.updated_values)
+        if "products" in updated:
+            try:
+                validate_shipment_serials(updated["products"])
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
         contact = {k: updated.pop(k, "") for k in ("gst_number", "contractor_person", "contractor_number", "contractor_email")}
         if "currency" in updated:
             updated["currency"] = (updated["currency"] or "INR").upper()

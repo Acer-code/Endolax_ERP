@@ -43,7 +43,30 @@ const PART_STATUS_LABELS = {
   assembly: 'Assembly',
   purchase: 'Purchase',
   warranty: 'Warranty',
+  product: 'Product',
 };
+function splitSerials(v) {
+  return String(v || '').split(/[\n,]+/).map(x => x.trim()).filter(Boolean);
+}
+function validateDraftSerials(d, includeParts) {
+  const seen = new Set();
+  const take = (label, need, list) => {
+    if (!list.length || (need !== null && list.length !== need)) return `${label}: enter ${need !== null ? 'exactly ' + need : 'at least 1'} serial number(s), found ${list.length}`;
+    const dup = list.find(x => seen.has(x) || (seen.add(x), false));
+    return dup ? `Serial number "${dup}" is repeated` : '';
+  };
+  for (const p of d.products) {
+    let err = take(`"${p.name}"`, Number(p.quantity) || 0, splitSerials(p.serials));
+    if (err) return err;
+    if (!includeParts) continue;
+    for (const part of p.parts) {
+      if (part.status !== 'product' || !part.name) continue;
+      err = take(`Part "${part.name}"`, null, splitSerials(part.serials));
+      if (err) return err;
+    }
+  }
+  return '';
+}
 function partStatusLabel(status) {
   return PART_STATUS_LABELS[status] || PART_STATUS_LABELS.assembly;
 }
@@ -115,7 +138,8 @@ function fromServerShape(s) {
       quantity: p.quantity,
       price: p.price,
       warranty: p.warranty || '',
-      parts: (p.parts || []).map(part => ({ name: part.part_name, quantity: part.quantity, status: part.status || 'assembly' })),
+      serials: (p.serial_numbers || []).join(', '),
+      parts: (p.parts || []).map(part => ({ name: part.part_name, quantity: part.quantity, status: part.status || 'assembly', serials: (part.serial_numbers || []).join(', ') })),
     })),
   };
 }
@@ -142,7 +166,11 @@ function toServerShape(s) {
       quantity: Number(p.quantity) || 0,
       price: Number(p.price) || 0,
       warranty: p.warranty || '',
-      parts: (p.parts || []).map(part => ({ part_name: part.name, quantity: Number(part.quantity) || 0, status: part.status || 'assembly' })),
+      serial_numbers: splitSerials(p.serials),
+      parts: (p.parts || []).map(part => {
+        const serials = part.status === 'product' ? splitSerials(part.serials) : [];
+        return { part_name: part.name, quantity: part.status === 'product' ? serials.length : (Number(part.quantity) || 0), status: part.status || 'assembly', serial_numbers: serials };
+      }),
     })),
   };
 }
@@ -228,6 +256,7 @@ function shipEnsureStyles() {
     .sh-chip{display:inline-block;font-size:10.5px;padding:1px 7px;border-radius:99px;background:#eef2ff;color:#3730a3;margin-left:4px}
     .sh-chip.purchase{background:#fff7ed;color:#9a3412}
     .sh-chip.warranty{background:#ecfdf5;color:#065f46}
+    .sh-chip.product{background:#fdf2f8;color:#9d174d}
     .sh-pill{padding:2px 9px;border-radius:99px;font-size:11.5px;font-weight:600}
     .sh-pill.received{background:#dcfce7;color:#166534}
     .sh-pill.pending{background:#fef3c7;color:#92400e}
@@ -507,10 +536,11 @@ function openViewModal(id) {
           <span>${curMoney(p.price, s.currency)} x ${p.quantity} = ${curMoney((Number(p.price) || 0) * (Number(p.quantity) || 0), s.currency)}</span>
         </div>
         ${p.warranty ? `<p style="font-size:12px;color:#64748b;margin-top:4px;">Warranty: ${p.warranty}</p>` : ''}
+        ${p.serials ? `<p style="font-size:12px;color:#64748b;margin-top:4px;">S/N: ${esc(p.serials)}</p>` : ''}
         ${(p.parts && p.parts.length) ? `
           <p style="font-size:12px;font-weight:600;color:#334155;margin-top:8px;">Parts</p>
           <ul style="margin:4px 0 0 18px;font-size:13px;color:#475569;">
-            ${p.parts.map(part => `<li>${part.name} — qty ${part.quantity} <span style="color:#94a3b8;">(${partStatusLabel(part.status)})</span></li>`).join('')}
+            ${p.parts.map(part => `<li>${part.name} — qty ${part.quantity} <span style="color:#94a3b8;">(${partStatusLabel(part.status)})</span>${part.serials ? `<br><small style="color:#64748b;">S/N: ${esc(part.serials)}</small>` : ''}</li>`).join('')}
           </ul>` : `<p style="font-size:12px;color:#94a3b8;margin-top:6px;">No parts added</p>`}
       </div>
     `).join('') || '<p style="color:#94a3b8;">No products added</p>'}
@@ -911,6 +941,11 @@ function renderStep2() {
         return;
       }
     }
+    const serialErr = validateDraftSerials({ products: valid }, false);
+    if (serialErr) {
+      showResponseModal('Serial numbers required', serialErr, false);
+      return;
+    }
     shipmentDraft.products = valid.map(p => ({ ...p, warranty: p.warranty || '', parts: p.parts || [] }));
     shipmentStep = 3;
     renderShipmentStep();
@@ -918,19 +953,20 @@ function renderStep2() {
 }
 
 function addProductRow() {
-  shipmentDraft.products.push({ name: '', quantity: '', price: '', warranty: '', parts: [] });
+  shipmentDraft.products.push({ name: '', quantity: '', price: '', warranty: '', serials: '', parts: [] });
 }
 
 function renderProductRows() {
   const wrap = document.getElementById('productRows');
   wrap.innerHTML = shipmentDraft.products.map((p, i) => `
-    <div style="display:flex;gap:8px;align-items:center;" data-row="${i}">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;" data-row="${i}">
       <input type="text" class="prodName" placeholder="Product Name" value="${p.name}" style="flex:2;">
       <input type="number" min="0" class="prodQty" placeholder="Qty" value="${p.quantity}" style="flex:1;">
       <input type="number" min="0" step="any" class="prodPrice" placeholder="Price (${shipmentDraft.currency})" value="${p.price}" style="flex:1;">
       <button type="button" class="removeProdBtn" data-index="${i}" style="border:none;background:#fee2e2;color:#dc2626;border-radius:8px;width:38px;height:38px;cursor:pointer;">
         <i class="fa-solid fa-xmark"></i>
       </button>
+      <textarea class="prodSerials" rows="2" placeholder="Serial numbers (required, one per unit, comma or new line separated)" style="flex:1 0 100%;resize:vertical;">${esc(p.serials || '')}</textarea>
     </div>
   `).join('');
 
@@ -974,6 +1010,7 @@ function readProductRowsIntoDraft() {
     shipmentDraft.products[i].name = row.querySelector('.prodName').value.trim();
     shipmentDraft.products[i].quantity = row.querySelector('.prodQty').value;
     shipmentDraft.products[i].price = row.querySelector('.prodPrice').value;
+    shipmentDraft.products[i].serials = row.querySelector('.prodSerials').value;
   });
 }
 
@@ -1013,21 +1050,23 @@ function renderPartsWizard() {
 
       <label style="font-size:12px;color:#64748b;">Warranty (for parts)</label>
       <input type="text" class="partWarranty" placeholder="e.g. 12 months" value="${p.warranty}" style="margin-bottom:6px;">
-      <p style="font-size:11px;color:#94a3b8;margin:0 0 10px;">Status: <b>Assembly</b> parts go to Inventory's Spare Parts on receive; <b>Purchase</b>/<b>Warranty</b> parts go to Service Parts.</p>
+      <p style="font-size:11px;color:#94a3b8;margin:0 0 10px;">Status: <b>Assembly</b> parts go to Inventory's Spare Parts on receive; <b>Purchase</b>/<b>Warranty</b> parts go to Service Parts; <b>Product</b> parts go straight to Inventory's Products (merged by name, serial numbers required).</p>
 
       <div class="partsRows" style="display:flex;flex-direction:column;gap:8px;">
         ${p.parts.map((part, prtIdx) => `
-          <div style="display:flex;gap:8px;align-items:center;" data-part="${prtIdx}">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;" data-part="${prtIdx}">
             <input type="text" class="partName" placeholder="Part Name" value="${part.name}" style="flex:2;">
-            <input type="number" min="0" class="partQty" placeholder="Qty" value="${part.quantity}" style="flex:1;">
+            <input type="number" min="0" class="partQty" placeholder="Qty" value="${part.status === 'product' ? splitSerials(part.serials).length : part.quantity}" ${part.status === 'product' ? 'readonly' : ''} style="flex:1;">
             <select class="partStatus" style="flex:1.2;">
               <option value="assembly" ${part.status === 'assembly' || !part.status ? 'selected' : ''}>Assembly</option>
               <option value="purchase" ${part.status === 'purchase' ? 'selected' : ''}>Purchase</option>
               <option value="warranty" ${part.status === 'warranty' ? 'selected' : ''}>Warranty</option>
+              <option value="product" ${part.status === 'product' ? 'selected' : ''}>Product</option>
             </select>
             <button type="button" class="removePartBtn" data-index="${prtIdx}" style="border:none;background:#fee2e2;color:#dc2626;border-radius:8px;width:34px;height:34px;cursor:pointer;">
               <i class="fa-solid fa-xmark"></i>
             </button>
+            <textarea class="partSerials" rows="2" placeholder="Serial numbers (required for Product, comma or new line separated)" style="flex:1 0 100%;resize:vertical;display:${part.status === 'product' ? 'block' : 'none'};">${esc(part.serials || '')}</textarea>
           </div>
         `).join('')}
       </div>
@@ -1047,8 +1086,22 @@ function renderPartsWizard() {
 
     section.querySelector('.addPartBtn').addEventListener('click', () => {
       syncPartsFromDom(pi);
-      shipmentDraft.products[pi].parts.push({ name: '', quantity: '', status: 'assembly' });
+      shipmentDraft.products[pi].parts.push({ name: '', quantity: '', status: 'assembly', serials: '' });
       renderPartsWizard();
+    });
+
+    section.querySelectorAll('.partStatus').forEach(sel => {
+      sel.addEventListener('change', () => {
+        syncPartsFromDom(pi);
+        renderPartsWizard();
+      });
+    });
+
+    section.querySelectorAll('.partSerials').forEach(box => {
+      box.addEventListener('input', () => {
+        const row = box.closest('[data-part]');
+        row.querySelector('.partQty').value = splitSerials(box.value).length;
+      });
     });
 
     section.querySelectorAll('.removePartBtn').forEach(btn => {
@@ -1069,7 +1122,10 @@ function syncPartsFromDom(productIndex) {
     const prtIdx = Number(row.dataset.part);
     shipmentDraft.products[productIndex].parts[prtIdx].name = row.querySelector('.partName').value.trim();
     shipmentDraft.products[productIndex].parts[prtIdx].quantity = row.querySelector('.partQty').value;
-    shipmentDraft.products[productIndex].parts[prtIdx].status = row.querySelector('.partStatus').value;
+    const part = shipmentDraft.products[productIndex].parts[prtIdx];
+    part.status = row.querySelector('.partStatus').value;
+    part.serials = row.querySelector('.partSerials').value;
+    if (part.status === 'product') part.quantity = splitSerials(part.serials).length;
   });
 }
 
@@ -1086,12 +1142,23 @@ async function finalizeShipment() {
     p.parts = p.parts.filter(part => part.name);
   });
 
+  const serialErr = validateDraftSerials(shipmentDraft, true);
+  if (serialErr) {
+    showResponseModal('Serial numbers required', serialErr, false);
+    return;
+  }
+
   if (shipmentDraft.isEdit) {
     try {
       const res = await apiFetch(`/shipment/update/${shipmentDraft.id}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ updated_values: toServerShape(shipmentDraft) })
       });
+      if (res.status === 400) {
+        const err = await res.json().catch(() => ({}));
+        showResponseModal('Shipment not saved', typeof err.detail === 'string' ? err.detail : 'Please check the details.', false);
+        return;
+      }
       if (!res.ok) throw new Error('update failed');
     } catch (err) {
       showResponseModal('Update failed', 'The shipment could not be updated.', false);

@@ -2,6 +2,7 @@ from mongodb.mongodb_connection import mongodbclient
 from logger import logging
 from bson import ObjectId
 import uuid
+import re
 
 
 class inventory_manager(mongodbclient):
@@ -955,6 +956,61 @@ class inventory_manager(mongodbclient):
 
         except Exception as e:
             logging.error("pushing assembled units into inventory failed!")
+            raise Exception(e)
+
+    def add_product_from_shipment(self, collection_name, product_name, serial_numbers,
+                                  supplier="", supplier_address="", purchase_date=None, invoice_no="", created_by=None):
+        try:
+            name = (product_name or "").strip()
+            serials = list(dict.fromkeys(str(s).strip() for s in (serial_numbers or []) if str(s).strip()))
+            if not name or not serials:
+                return None
+
+            taken = self.get_data(collection_name=collection_name,
+                                  query={"serial_numbers": {"$in": serials}, "product_type": "product"})
+            owned = {s for e in taken for s in (e.get("serial_numbers") or [])}
+            clash = [s for s in serials if s in owned]
+            if clash:
+                raise Exception(f"serial number(s) already in inventory: {', '.join(clash)}")
+
+            existing = self.get_data(
+                collection_name=collection_name,
+                query={"product_name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}, "product_type": "product"}
+            )
+            if existing:
+                entry = existing[0]
+                self.update_data(
+                    collection_name=collection_name,
+                    query={"_id": ObjectId(entry["_id"])},
+                    update_values={"serial_numbers": (entry.get("serial_numbers") or []) + serials,
+                                   "quantity": int(entry.get("quantity", 0) or 0) + len(serials),
+                                   "updated_by": created_by}
+                )
+                return {"part_name": name, "mode": "merged", "quantity_added": len(serials)}
+
+            product_dic = {
+                "product_name": name,
+                "product_id": f"SH-{uuid.uuid4().hex[:8].upper()}",
+                "lot_no": "",
+                "supplier": supplier,
+                "supplier_address": supplier_address,
+                "invoice_no": invoice_no or "",
+                "price": 0,
+                "tax_rate": 0,
+                "purchase_date": purchase_date,
+                "quantity": len(serials),
+                "model_no": "",
+                "serial_numbers": serials,
+                "product_type": "product",
+                "warranty_until": None,
+                "reason": "",
+                "created_by": created_by,
+                "updated_by": created_by,
+            }
+            super().add(collection_name=collection_name, dictionary=product_dic)
+            return {"part_name": name, "mode": "created", "quantity_added": len(serials)}
+        except Exception as e:
+            logging.error("pushing shipment product into inventory failed!")
             raise Exception(e)
 
     def add_from_shipment_parts(self, collection_name, parts, product_type,
