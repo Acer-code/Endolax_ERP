@@ -461,7 +461,6 @@ class ShipmentProduct(BaseModel):
     quantity: int = 0
     price: float = 0
     warranty: str = ""            # e.g. "12 months" - optional
-    serial_numbers: list[str] = []
     parts: list[ShipmentPart] = []
 
 
@@ -2000,8 +1999,7 @@ def create_shipment(request: CreateShipmentRequest, user: dict = Depends(require
             validate_shipment_serials(shipment_dict["products"])
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
-        all_serials = [x for p in shipment_dict["products"] for x in split_serials(p.get("serial_numbers"))]
-        all_serials += [x for p in shipment_dict["products"] for pt in p.get("parts", []) if pt.get("status") == "product" for x in split_serials(pt.get("serial_numbers"))]
+        all_serials = [x for p in shipment_dict["products"] for pt in p.get("parts", []) if pt.get("status") == "product" for x in split_serials(pt.get("serial_numbers"))]
         owned = inventory_manager().get_data(collection_name=INVENTORY_COLLECTION, query={"serial_numbers": {"$in": all_serials}, "product_type": "product"})
         clash = sorted({x for e in owned for x in (e.get("serial_numbers") or []) if x in all_serials})
         if clash:

@@ -56,12 +56,9 @@ function validateDraftSerials(d, includeParts) {
     return dup ? `Serial number "${dup}" is repeated` : '';
   };
   for (const p of d.products) {
-    let err = take(`"${p.name}"`, Number(p.quantity) || 0, splitSerials(p.serials));
-    if (err) return err;
-    if (!includeParts) continue;
     for (const part of p.parts) {
       if (part.status !== 'product' || !part.name) continue;
-      err = take(`Part "${part.name}"`, null, splitSerials(part.serials));
+      const err = take(`Part "${part.name}"`, null, splitSerials(part.serials));
       if (err) return err;
     }
   }
@@ -138,7 +135,6 @@ function fromServerShape(s) {
       quantity: p.quantity,
       price: p.price,
       warranty: p.warranty || '',
-      serials: (p.serial_numbers || []).join(', '),
       parts: (p.parts || []).map(part => ({ name: part.part_name, quantity: part.quantity, status: part.status || 'assembly', serials: (part.serial_numbers || []).join(', ') })),
     })),
   };
@@ -166,7 +162,6 @@ function toServerShape(s) {
       quantity: Number(p.quantity) || 0,
       price: Number(p.price) || 0,
       warranty: p.warranty || '',
-      serial_numbers: splitSerials(p.serials),
       parts: (p.parts || []).map(part => {
         const serials = part.status === 'product' ? splitSerials(part.serials) : [];
         return { part_name: part.name, quantity: part.status === 'product' ? serials.length : (Number(part.quantity) || 0), status: part.status || 'assembly', serial_numbers: serials };
@@ -536,7 +531,6 @@ function openViewModal(id) {
           <span>${curMoney(p.price, s.currency)} x ${p.quantity} = ${curMoney((Number(p.price) || 0) * (Number(p.quantity) || 0), s.currency)}</span>
         </div>
         ${p.warranty ? `<p style="font-size:12px;color:#64748b;margin-top:4px;">Warranty: ${p.warranty}</p>` : ''}
-        ${p.serials ? `<p style="font-size:12px;color:#64748b;margin-top:4px;">S/N: ${esc(p.serials)}</p>` : ''}
         ${(p.parts && p.parts.length) ? `
           <p style="font-size:12px;font-weight:600;color:#334155;margin-top:8px;">Parts</p>
           <ul style="margin:4px 0 0 18px;font-size:13px;color:#475569;">
@@ -941,11 +935,6 @@ function renderStep2() {
         return;
       }
     }
-    const serialErr = validateDraftSerials({ products: valid }, false);
-    if (serialErr) {
-      showResponseModal('Serial numbers required', serialErr, false);
-      return;
-    }
     shipmentDraft.products = valid.map(p => ({ ...p, warranty: p.warranty || '', parts: p.parts || [] }));
     shipmentStep = 3;
     renderShipmentStep();
@@ -953,20 +942,19 @@ function renderStep2() {
 }
 
 function addProductRow() {
-  shipmentDraft.products.push({ name: '', quantity: '', price: '', warranty: '', serials: '', parts: [] });
+  shipmentDraft.products.push({ name: '', quantity: '', price: '', warranty: '', parts: [] });
 }
 
 function renderProductRows() {
   const wrap = document.getElementById('productRows');
   wrap.innerHTML = shipmentDraft.products.map((p, i) => `
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;" data-row="${i}">
+    <div style="display:flex;gap:8px;align-items:center;" data-row="${i}">
       <input type="text" class="prodName" placeholder="Product Name" value="${p.name}" style="flex:2;">
       <input type="number" min="0" class="prodQty" placeholder="Qty" value="${p.quantity}" style="flex:1;">
       <input type="number" min="0" step="any" class="prodPrice" placeholder="Price (${shipmentDraft.currency})" value="${p.price}" style="flex:1;">
       <button type="button" class="removeProdBtn" data-index="${i}" style="border:none;background:#fee2e2;color:#dc2626;border-radius:8px;width:38px;height:38px;cursor:pointer;">
         <i class="fa-solid fa-xmark"></i>
       </button>
-      <textarea class="prodSerials" rows="2" placeholder="Serial numbers (required, one per unit, comma or new line separated)" style="flex:1 0 100%;resize:vertical;">${esc(p.serials || '')}</textarea>
     </div>
   `).join('');
 
@@ -1010,7 +998,6 @@ function readProductRowsIntoDraft() {
     shipmentDraft.products[i].name = row.querySelector('.prodName').value.trim();
     shipmentDraft.products[i].quantity = row.querySelector('.prodQty').value;
     shipmentDraft.products[i].price = row.querySelector('.prodPrice').value;
-    shipmentDraft.products[i].serials = row.querySelector('.prodSerials').value;
   });
 }
 

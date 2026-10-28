@@ -26,7 +26,6 @@ def validate_shipment_serials(products):
 
     for product in products:
         name = product.get("product_name") or "product"
-        check(f"'{name}'", int(product.get("quantity") or 0), split_serials(product.get("serial_numbers")))
         for part in product.get("parts") or []:
             if part.get("status") == "product":
                 serials = split_serials(part.get("serial_numbers"))
@@ -132,7 +131,6 @@ class shipment_manager(mongodbclient):
                 "price": price,
                 "line_total": price * quantity,
                 "warranty": product.get("warranty", "") or "",
-                "serial_numbers": split_serials(product.get("serial_numbers")),
                 "parts": parts,
             })
         return normalized
