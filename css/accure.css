@@ -71,16 +71,20 @@ img {
   max-width: 100%;
   display: block;
 }
+
 ::-webkit-scrollbar {
   width: 8px;
 }
+
 ::-webkit-scrollbar-track {
   background: var(--bg-main);
 }
+
 ::-webkit-scrollbar-thumb {
   background: var(--primary);
   border-radius: 20px;
 }
+
 .container {
   display: flex;
   min-height: 100vh;
@@ -878,10 +882,10 @@ form .save-btn {
   content: '';
   position: absolute;
   inset: 0;
-  background: linear-gradient(135deg, rgba(255,255,255,0.85), rgba(255,255,255,0.4));
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0.4));
 }
 
-.login-left > * {
+.login-left>* {
   position: relative;
   z-index: 2;
 }
@@ -1058,6 +1062,7 @@ form .save-btn {
     transform: translateY(-40px) scale(0.95);
     opacity: 0;
   }
+
   to {
     transform: translateY(0) scale(1);
     opacity: 1;
@@ -1357,6 +1362,7 @@ form .save-btn {
   .login-left {
     margin: auto;
   }
+
   .login-right {
     margin: auto;
   }
@@ -1392,10 +1398,12 @@ form .save-btn {
     width: 50px;
     padding: 8px;
   }
+
   .sidebar ul li a {
     margin-left: -1px;
     padding-left: 0px;
   }
+
   .sidebar ul li.active a {
     background: var(--primary-gradient);
     color: #fff;
@@ -1857,4 +1865,33 @@ form .save-btn {
 
 .manager-box label {
   font-weight: 600;
+}
+
+.erp-switch {
+  gap: 6px;
+  align-items: center;
+  margin-right: 12px
+}
+
+.erp-btn {
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap
+}
+
+.erp-btn:hover {
+  background: #f1f5f9
+}
+
+.erp-btn.active {
+  background: #1665ff;
+  border-color: #1665ff;
+  color: #fff;
+  pointer-events: none
 }

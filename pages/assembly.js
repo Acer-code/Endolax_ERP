@@ -1307,8 +1307,7 @@ async function saveAssemblyEdit() {
     assemblyDraft = null;
     editingAssemblyId = null;
     await loadAssemblies();
-    await loadAvailableParts();   // inventory stock may have moved — refresh
-
+    await loadAvailableParts();   
     const changes = data.inventory_changes || [];
     const summary = changes.length
       ? 'Inventory updated: ' + changes.map(c => `${c.part_name} ${c.action} ${c.quantity}`).join(', ') + '.'
